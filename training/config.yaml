@@ -4,7 +4,7 @@
 # ============================================================
 
 env:
-  n_drones: 3
+  n_drones: 6
   room_size: [10.0, 10.0, 3.0]
   max_steps: 500
   coop_time_threshold: 0.7   # fraction of max_steps for coop bonus
@@ -19,8 +19,8 @@ model:
 
 training:
   total_timesteps: 5_000_000
-  rollout_steps: 2048        # steps collected per update
-  mini_batch_size: 64
+  rollout_steps: 4096        # steps collected per update (2× = fewer Python loop round-trips)
+  mini_batch_size: 256       # larger batches = fewer PPO iterations per update
   n_epochs: 5                # fewer epochs → less chance of overshooting (was 10)
   gamma: 0.99                # discount factor
   gae_lambda: 0.95           # GAE smoothing
@@ -31,7 +31,7 @@ training:
   lr_actor: 1.0e-4           # slower actor updates prevent mean from chasing noise (was 3e-4)
   lr_critic: 1.0e-3
   normalise_rewards: true
-  device: "cpu"              # change to "cuda" if GPU available
+  device: "cpu"              # MPS overhead not worth it for small MLPs
 
 curriculum:
   enabled: true
