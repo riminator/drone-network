@@ -183,7 +183,21 @@ class PybulletHomeEnv(MultiAgentEnv):
             record=self.record,
             pyb_freq=240,                         # physics Hz (v2 API)
             ctrl_freq=48,                         # control Hz
+            user_debug_gui=False,                 # hide propeller RPM sliders
         )
+
+        # Position the camera to frame the whole 10×10m room from above-and-behind
+        if self.gui:
+            client = self._aviary.getPyBulletClient()
+            cx = self.room_size[0] / 2   # room centre x  (5.0)
+            cy = self.room_size[1] / 2   # room centre y  (5.0)
+            p.resetDebugVisualizerCamera(
+                cameraDistance=12,          # zoom: 12m back shows full 10×10 room
+                cameraYaw=45,              # 45° side angle — diagonal overview
+                cameraPitch=-40,           # looking slightly down
+                cameraTargetPosition=[cx, cy, 1.0],
+                physicsClientId=client,
+            )
 
         # Load household scene objects into the same PyBullet world
         self._task_object_ids = []
