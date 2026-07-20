@@ -31,7 +31,7 @@ training:
   lr_actor: 1.0e-4           # slower actor updates prevent mean from chasing noise (was 3e-4)
   lr_critic: 1.0e-3
   normalise_rewards: true
-  device: "cpu"              # MPS overhead not worth it for small MLPs
+  device: "auto"             # auto: cuda → mps → cpu (overridden at runtime)
 
 curriculum:
   enabled: true

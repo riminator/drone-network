@@ -204,7 +204,16 @@ def _save_checkpoint(
 # ---------------------------------------------------------------------------
 
 def train(cfg: dict):
-    device = cfg["training"]["device"]
+    # Auto-detect best available device, ignoring whatever is in config.
+    # Priority: CUDA (Nvidia, Windows/Linux) → MPS (Apple Silicon) → CPU
+    import torch as _torch
+    _cfg_device = cfg["training"]["device"]
+    if _cfg_device != "cpu" and _torch.cuda.is_available():
+        device = "cuda"
+    elif _cfg_device not in ("cpu", "cuda") and _torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     obs_dim = cfg["model"]["obs_dim"]
     act_dim = cfg["model"]["act_dim"]
     n_drones = cfg["env"]["n_drones"]
