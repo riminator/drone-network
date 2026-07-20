@@ -199,15 +199,15 @@ class PybulletHomeEnv(MultiAgentEnv):
                 physicsClientId=client,
             )
 
-        # Load household scene objects into the same PyBullet world
-        self._task_object_ids = []
-        self._load_scene()
-
-        # Instantiate task logic
+        # Instantiate task logic FIRST — _load_scene() iterates over self._tasks
         self._tasks = [
             _make_task(t, i, pos, steps)
             for i, (t, pos, steps) in enumerate(self.task_layouts)
         ]
+
+        # Load household scene objects into the same PyBullet world
+        self._task_object_ids = []
+        self._load_scene()
 
         self._step_count = 0
         self._drone_task_map = {aid: None for aid in self._agent_ids}
@@ -231,11 +231,17 @@ class PybulletHomeEnv(MultiAgentEnv):
         rewards = {aid: REWARD_STEP_ALIVE for aid in self._agent_ids}
 
         # --- Convert policy actions → VelocityAviary format ---
-        # VelocityAviary expects shape (n_drones, 4): [vx, vy, vz, yaw_rate]
+        # The policy outputs tanh-squashed values in [-1, 1] representing
+        # displacement per step in HomeEnv (MAX_SPEED=0.5 m/step).
+        # VelocityAviary expects velocity commands in m/s at ctrl_freq=48 Hz.
+        # Scale factor: HomeEnv step ≈ 0.5m, ctrl period = 1/48s
+        # → target_vel = action * MAX_SPEED * ctrl_freq = action * 0.5 * 48 = action * 24
+        # Clamp to a reasonable physical max (3 m/s) so the Crazyflie doesn't overshoot.
+        VEL_SCALE = 3.0   # m/s per unit action — matches Crazyflie's practical speed range
         vel_cmds = np.zeros((self.n_drones, 4), dtype=np.float32)
         for i, aid in enumerate(agent_ids_sorted):
             action = action_dict.get(aid, np.zeros(self.ACT_DIM))
-            vel_cmds[i, :3] = action[:3]   # dx/dy/dz → vx/vy/vz (same scale)
+            vel_cmds[i, :3] = np.clip(action[:3] * VEL_SCALE, -VEL_SCALE, VEL_SCALE)
             vel_cmds[i, 3]  = 0.0          # keep yaw fixed
             self._tool_engaged[aid] = float(action[3]) > 0.5
 
@@ -284,7 +290,8 @@ class PybulletHomeEnv(MultiAgentEnv):
         # --- Termination ---
         all_tasks_done = all(t.completed for t in self._tasks)
         time_limit     = self._step_count >= self.max_steps
-        pb_done        = bool(terminated_pb) or bool(truncated_pb)  # crash / out of bounds
+        # VelocityAviary returns numpy arrays — use .any() to safely collapse to bool
+        pb_done = bool(np.asarray(terminated_pb).any()) or bool(np.asarray(truncated_pb).any())
 
         terminated = {aid: all_tasks_done or pb_done for aid in self._agent_ids}
         truncated  = {aid: time_limit for aid in self._agent_ids}
@@ -329,6 +336,8 @@ class PybulletHomeEnv(MultiAgentEnv):
                 body_id = p.loadURDF(
                     str(urdf_file),
                     basePosition=pos,
+                    useFixedBase=True,          # scene props don't fall or move
+                    flags=p.URDF_ENABLE_CACHED_GRAPHICS_SHAPES,
                     physicsClientId=client,
                 )
             else:

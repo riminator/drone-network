@@ -2,7 +2,7 @@
 <!-- Plant pot — short cylinder with green foliage sphere on top -->
 <robot name="plant_pot">
 
-  <!-- Pot body -->
+  <!-- Pot body (base link — has real inertia) -->
   <link name="pot">
     <inertial>
       <mass value="0.5"/>
@@ -25,8 +25,12 @@
     </collision>
   </link>
 
-  <!-- Foliage sphere -->
+  <!-- Foliage sphere (visual-only — zero mass so it doesn't act as a physics body) -->
   <link name="foliage">
+    <inertial>
+      <mass value="0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
     <visual>
       <geometry>
         <sphere radius="0.18"/>

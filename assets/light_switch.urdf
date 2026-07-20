@@ -2,7 +2,7 @@
 <!-- Light switch — wall-mounted flat box with a yellow paddle -->
 <robot name="light_switch">
 
-  <!-- Back plate -->
+  <!-- Back plate (base link) -->
   <link name="plate">
     <inertial>
       <mass value="0.1"/>
@@ -24,8 +24,12 @@
     </collision>
   </link>
 
-  <!-- Paddle/toggle -->
+  <!-- Paddle (visual-only — zero mass) -->
   <link name="paddle">
+    <inertial>
+      <mass value="0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
     <visual>
       <geometry>
         <box size="0.04 0.03 0.07"/>
