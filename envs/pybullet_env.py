@@ -131,7 +131,6 @@ class PybulletHomeEnv(MultiAgentEnv):
         self.gui: bool            = config.get("gui", True)
         self.record: bool         = config.get("record", False)
         self.coop_time_threshold  = config.get("coop_time_threshold", 0.7)
-        # Slow-motion factor — 1.0 = real-time, 0.1 = 10× slower
         self.time_scale: float    = config.get("time_scale", 1.0)
 
         self._agent_ids = {f"drone_{i}" for i in range(self.n_drones)}
@@ -147,17 +146,56 @@ class PybulletHomeEnv(MultiAgentEnv):
             dtype=np.float32,
         )
 
-        # Populated on reset()
-        self._aviary: VelocityAviary | None = None
+        # Episode state — populated/reset in reset()
         self._tasks: list = []
         self._drone_task_map: dict[str, int | None] = {}
         self._step_count: int = 0
         self._tool_engaged: dict[str, bool] = {}
-        self._task_object_ids: list[int] = []   # PyBullet body IDs for scene objects
+        self._task_object_ids: list[int] = []
+
+        # Create the aviary ONCE here so the OS window is opened only once.
+        # reset() repositions drones in-place without destroying the physics world.
+        self._init_xyzs = self._get_init_positions()
+        self._aviary = VelocityAviary(
+            drone_model=DroneModel.CF2X,
+            num_drones=self.n_drones,
+            initial_xyzs=self._init_xyzs,
+            physics=Physics.PYB,
+            gui=self.gui,
+            record=self.record,
+            pyb_freq=240,
+            ctrl_freq=48,
+            user_debug_gui=False,
+        )
+
+        # Set camera once after the aviary has finished its own GUI init
+        if self.gui:
+            self._set_camera()
+
+        # Load scene objects once (they never move between episodes)
+        self._task_object_ids = []
+        self._tasks = [
+            _make_task(t, i, pos, steps)
+            for i, (t, pos, steps) in enumerate(self.task_layouts)
+        ]
+        self._load_scene()
 
     # ------------------------------------------------------------------
     # Gymnasium / RLlib interface
     # ------------------------------------------------------------------
+
+    def _set_camera(self):
+        """Point the camera at the room centre from a useful angle."""
+        client = self._aviary.getPyBulletClient()
+        cx = self.room_size[0] / 2
+        cy = self.room_size[1] / 2
+        p.resetDebugVisualizerCamera(
+            cameraDistance=12,
+            cameraYaw=45,
+            cameraPitch=-40,
+            cameraTargetPosition=[cx, cy, 1.0],
+            physicsClientId=client,
+        )
 
     def reset(
         self,
@@ -168,50 +206,31 @@ class PybulletHomeEnv(MultiAgentEnv):
         if seed is not None:
             np.random.seed(seed)
 
-        # Close previous aviary if one exists
-        if self._aviary is not None:
-            self._aviary.close()
+        client = self._aviary.getPyBulletClient()
 
-        init_xyzs = self._get_init_positions()
-
-        self._aviary = VelocityAviary(
-            drone_model=DroneModel.CF2X,          # Crazyflie 2.X
-            num_drones=self.n_drones,
-            initial_xyzs=init_xyzs,
-            physics=Physics.PYB,                  # standard PyBullet physics
-            gui=self.gui,
-            record=self.record,
-            pyb_freq=240,                         # physics Hz (v2 API)
-            ctrl_freq=48,                         # control Hz
-            user_debug_gui=False,                 # hide propeller RPM sliders
-        )
-
-        # Position the camera to frame the whole 10×10m room from above-and-behind
-        if self.gui:
-            client = self._aviary.getPyBulletClient()
-            cx = self.room_size[0] / 2   # room centre x  (5.0)
-            cy = self.room_size[1] / 2   # room centre y  (5.0)
-            p.resetDebugVisualizerCamera(
-                cameraDistance=12,          # zoom: 12m back shows full 10×10 room
-                cameraYaw=45,              # 45° side angle — diagonal overview
-                cameraPitch=-40,           # looking slightly down
-                cameraTargetPosition=[cx, cy, 1.0],
+        # Soft-reset: reposition drones at spawn positions without closing the window
+        identity_quat = [0.0, 0.0, 0.0, 1.0]
+        zero_vel      = [0.0, 0.0, 0.0]
+        drone_ids = self._aviary.getDroneIds()
+        for i, drone_id in enumerate(drone_ids):
+            p.resetBasePositionAndOrientation(
+                drone_id, self._init_xyzs[i].tolist(), identity_quat,
+                physicsClientId=client,
+            )
+            p.resetBaseVelocity(
+                drone_id, zero_vel, zero_vel,
                 physicsClientId=client,
             )
 
-        # Instantiate task logic FIRST — _load_scene() iterates over self._tasks
-        self._tasks = [
-            _make_task(t, i, pos, steps)
-            for i, (t, pos, steps) in enumerate(self.task_layouts)
-        ]
-
-        # Load household scene objects into the same PyBullet world
-        self._task_object_ids = []
-        self._load_scene()
+        # Reset task logic — re-instantiate so progress counters are zeroed
+        for task in self._tasks:
+            task.reset()
+        # Restore task object visuals (completed tasks were greyed out)
+        self._restore_task_visuals()
 
         self._step_count = 0
         self._drone_task_map = {aid: None for aid in self._agent_ids}
-        self._tool_engaged = {aid: False for aid in self._agent_ids}
+        self._tool_engaged   = {aid: False for aid in self._agent_ids}
         self._assign_tasks()
 
         obs = self._build_obs_dict()
@@ -306,6 +325,21 @@ class PybulletHomeEnv(MultiAgentEnv):
         if self._aviary is not None:
             self._aviary.close()
             self._aviary = None
+
+    def _restore_task_visuals(self):
+        """Restore task marker colours after a reset (completed tasks were greyed)."""
+        if not self._task_object_ids:
+            return
+        client = self._aviary.getPyBulletClient()
+        for i, task in enumerate(self._tasks):
+            if i >= len(self._task_object_ids):
+                break
+            colour = _TASK_COLOURS.get(task.spec.task_type, [0.5, 0.5, 1.0, 1.0])
+            p.changeVisualShape(
+                self._task_object_ids[i], -1,
+                rgbaColor=colour,
+                physicsClientId=client,
+            )
 
     # ------------------------------------------------------------------
     # Scene loading
