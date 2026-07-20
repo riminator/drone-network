@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<!-- Light switch — wall-mounted flat box with a yellow paddle -->
+<robot name="light_switch">
+
+  <!-- Back plate -->
+  <link name="plate">
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <box size="0.08 0.04 0.12"/>
+      </geometry>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <material name="white">
+        <color rgba="0.95 0.95 0.95 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="0.08 0.04 0.12"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- Paddle/toggle -->
+  <link name="paddle">
+    <visual>
+      <geometry>
+        <box size="0.04 0.03 0.07"/>
+      </geometry>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <material name="yellow">
+        <color rgba="1.0 0.90 0.0 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <joint name="paddle_joint" type="fixed">
+    <parent link="plate"/>
+    <child link="paddle"/>
+    <origin xyz="0 0.035 0.02" rpy="0 0 0"/>
+  </joint>
+
+</robot>

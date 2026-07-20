@@ -1,0 +1,48 @@
+# ============================================================
+# MAPPO Training Configuration
+# Drone Swarm — Household Tasks
+# ============================================================
+
+env:
+  n_drones: 3
+  room_size: [10.0, 10.0, 3.0]
+  max_steps: 500
+  coop_time_threshold: 0.7   # fraction of max_steps for coop bonus
+
+model:
+  obs_dim: 15
+  act_dim: 4
+  actor_hidden: [256, 256]
+  critic_hidden: [512, 256]
+
+training:
+  total_timesteps: 5_000_000
+  rollout_steps: 2048        # steps collected per update
+  mini_batch_size: 64
+  n_epochs: 5                # fewer epochs → less chance of overshooting (was 10)
+  gamma: 0.99                # discount factor
+  gae_lambda: 0.95           # GAE smoothing
+  clip_eps: 0.2              # PPO clip epsilon
+  entropy_coef: 0.005        # lowered: log_std is now bounded, less regularisation needed (was 0.01)
+  value_coef: 0.5            # critic loss weight
+  max_grad_norm: 0.5         # gradient clipping
+  lr_actor: 1.0e-4           # slower actor updates prevent mean from chasing noise (was 3e-4)
+  lr_critic: 1.0e-3
+  normalise_rewards: true
+  device: "cpu"              # change to "cuda" if GPU available
+
+curriculum:
+  enabled: true
+  # Mean episode reward thresholds to advance stages
+  stage_thresholds: [5.0, 15.0, 30.0, 50.0]
+  patience: 3                # consecutive evals above threshold to advance
+
+logging:
+  log_interval: 10           # log every N updates
+  eval_interval: 50          # evaluate (no exploration) every N updates
+  eval_episodes: 5
+  checkpoint_interval: 100   # save model every N updates
+  checkpoint_dir: "checkpoints"
+  use_wandb: false           # set true to enable Weights & Biases
+  wandb_project: "drone-swarm"
+  wandb_entity: null

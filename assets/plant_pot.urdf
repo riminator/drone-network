@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!-- Plant pot — short cylinder with green foliage sphere on top -->
+<robot name="plant_pot">
+
+  <!-- Pot body -->
+  <link name="pot">
+    <inertial>
+      <mass value="0.5"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <cylinder radius="0.12" length="0.22"/>
+      </geometry>
+      <origin xyz="0 0 0.11" rpy="0 0 0"/>
+      <material name="terracotta">
+        <color rgba="0.72 0.40 0.20 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <cylinder radius="0.12" length="0.22"/>
+      </geometry>
+      <origin xyz="0 0 0.11" rpy="0 0 0"/>
+    </collision>
+  </link>
+
+  <!-- Foliage sphere -->
+  <link name="foliage">
+    <visual>
+      <geometry>
+        <sphere radius="0.18"/>
+      </geometry>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <material name="green">
+        <color rgba="0.10 0.60 0.10 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <joint name="foliage_joint" type="fixed">
+    <parent link="pot"/>
+    <child link="foliage"/>
+    <origin xyz="0 0 0.38" rpy="0 0 0"/>
+  </joint>
+
+</robot>
