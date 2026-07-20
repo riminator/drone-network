@@ -154,6 +154,11 @@ class PybulletHomeEnv(MultiAgentEnv):
         self._task_object_ids: list[int] = []
         self._init_xyzs = self._get_init_positions()
 
+        # Debug overlay state (GUI only) — item IDs so we can move/replace them
+        self._debug_drone_labels: dict[str, int] = {}  # aid → debug text item id
+        self._debug_task_lines: dict[str, int] = {}    # aid → debug line item id
+        self._debug_hud_id: int = -1                    # single HUD text item
+
         # Create the aviary ONCE — opens the OS window a single time.
         # Each episode calls aviary.reset() which calls p.resetSimulation()
         # internally, then we reload the lightweight scene objects.
@@ -166,7 +171,7 @@ class PybulletHomeEnv(MultiAgentEnv):
             record=self.record,
             pyb_freq=240,
             ctrl_freq=48,
-            user_debug_gui=False,
+            user_debug_gui=self.gui,
         )
 
         # Camera is set after aviary.__init__ finishes its own GUI setup
@@ -183,12 +188,15 @@ class PybulletHomeEnv(MultiAgentEnv):
         cx = self.room_size[0] / 2
         cy = self.room_size[1] / 2
         p.resetDebugVisualizerCamera(
-            cameraDistance=12,
-            cameraYaw=45,
-            cameraPitch=-40,
-            cameraTargetPosition=[cx, cy, 1.0],
+            cameraDistance=8,
+            cameraYaw=30,
+            cameraPitch=-35,
+            cameraTargetPosition=[cx, cy, 0.8],
             physicsClientId=client,
         )
+        # Remove distracting default axes / grid overlays
+        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1, physicsClientId=client)
+        p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0, physicsClientId=client)
 
     def reset(
         self,
@@ -254,9 +262,9 @@ class PybulletHomeEnv(MultiAgentEnv):
             direction = action[:3].astype(np.float32)
             norm = float(np.linalg.norm(direction))
             vel_cmds[i, :3] = direction                     # VelocityAviary normalises this internally
-            # Use full speed (1.0) whenever the policy wants to move.
-            # Small tanh norms near the target would otherwise make the drone crawl.
-            vel_cmds[i, 3]  = 1.0 if norm > 0.05 else 0.0  # dead-band below 0.05 → hover
+            # Scale speed proportionally to action magnitude so gentle corrections
+            # don't snap to zero.  Dead-band is 0.01 to suppress pure noise.
+            vel_cmds[i, 3]  = float(np.clip(norm, 0.0, 1.0)) if norm > 0.01 else 0.0
             self._tool_engaged[aid] = float(action[3]) > 0.5
 
         # --- Step the physics ---
@@ -314,7 +322,84 @@ class PybulletHomeEnv(MultiAgentEnv):
 
         obs   = self._build_obs_dict()
         infos = self._build_info_dict()
+
+        if self.gui:
+            self._update_debug_visuals(real_positions, agent_ids_sorted)
+
         return obs, rewards, terminated, truncated, infos
+
+    def _update_debug_visuals(
+        self,
+        real_positions: np.ndarray,
+        agent_ids_sorted: list[str],
+    ):
+        """Refresh per-drone labels, task-target lines, and HUD text each step."""
+        client = self._aviary.getPyBulletClient()
+
+        # ── Per-drone floating label ──────────────────────────────────────────
+        for i, aid in enumerate(agent_ids_sorted):
+            pos = real_positions[i].tolist()
+            label_pos = [pos[0], pos[1], pos[2] + 0.25]
+
+            task_idx = self._drone_task_map.get(aid)
+            if task_idx is not None and not self._tasks[task_idx].completed:
+                prog = (
+                    self._tasks[task_idx].engage_steps_done
+                    / self._tasks[task_idx].spec.engage_steps_required
+                )
+                label = f"{aid}  {prog*100:.0f}%"
+            else:
+                label = f"{aid}  idle"
+
+            prev = self._debug_drone_labels.get(aid, -1)
+            item_id = p.addUserDebugText(
+                label,
+                label_pos,
+                textColorRGB=[0.2, 0.8, 1.0],
+                textSize=1.2,
+                replaceItemUniqueId=prev if prev != -1 else -1,
+                physicsClientId=client,
+            )
+            self._debug_drone_labels[aid] = item_id
+
+        # ── Drone → target line ───────────────────────────────────────────────
+        for i, aid in enumerate(agent_ids_sorted):
+            task_idx = self._drone_task_map.get(aid)
+            prev_line = self._debug_task_lines.get(aid, -1)
+
+            if task_idx is not None and not self._tasks[task_idx].completed:
+                target = self._tasks[task_idx].spec.target_position.tolist()
+                drone_pos = real_positions[i].tolist()
+                colour = _TASK_COLOURS.get(
+                    self._tasks[task_idx].spec.task_type, [1.0, 1.0, 1.0]
+                )[:3]
+                item_id = p.addUserDebugLine(
+                    drone_pos, target,
+                    lineColorRGB=colour,
+                    lineWidth=1.5,
+                    replaceItemUniqueId=prev_line if prev_line != -1 else -1,
+                    physicsClientId=client,
+                )
+                self._debug_task_lines[aid] = item_id
+            elif prev_line != -1:
+                # Task done — remove the line
+                p.removeUserDebugItem(prev_line, physicsClientId=client)
+                self._debug_task_lines[aid] = -1
+
+        # ── HUD: step counter + task summary ─────────────────────────────────
+        done_count = sum(1 for t in self._tasks if t.completed)
+        hud = (
+            f"Step {self._step_count}/{self.max_steps}   "
+            f"Tasks {done_count}/{len(self._tasks)}"
+        )
+        self._debug_hud_id = p.addUserDebugText(
+            hud,
+            [0.3, 0.3, 2.8],
+            textColorRGB=[1.0, 1.0, 0.3],
+            textSize=1.5,
+            replaceItemUniqueId=self._debug_hud_id if self._debug_hud_id != -1 else -1,
+            physicsClientId=client,
+        )
 
     def close(self):
         if self._aviary is not None:
@@ -396,7 +481,7 @@ class PybulletHomeEnv(MultiAgentEnv):
             )
             vis_id = p.createVisualShape(
                 p.GEOM_BOX, halfExtents=half_ext,
-                rgbaColor=[0.85, 0.85, 0.85, 0.4],
+                rgbaColor=[0.75, 0.85, 1.0, 0.55],   # light-blue tint, more opaque
                 physicsClientId=client,
             )
             p.createMultiBody(
@@ -408,7 +493,7 @@ class PybulletHomeEnv(MultiAgentEnv):
             )
 
     def _create_sphere_marker(
-        self, pos: list, colour: list, radius: float = 0.15, client: int = 0
+        self, pos: list, colour: list, radius: float = 0.30, client: int = 0
     ) -> int:
         """Create a visual-only sphere (no collision) as a task target marker."""
         vis_id = p.createVisualShape(
