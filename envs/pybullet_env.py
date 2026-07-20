@@ -152,10 +152,11 @@ class PybulletHomeEnv(MultiAgentEnv):
         self._step_count: int = 0
         self._tool_engaged: dict[str, bool] = {}
         self._task_object_ids: list[int] = []
-
-        # Create the aviary ONCE here so the OS window is opened only once.
-        # reset() repositions drones in-place without destroying the physics world.
         self._init_xyzs = self._get_init_positions()
+
+        # Create the aviary ONCE — opens the OS window a single time.
+        # Each episode calls aviary.reset() which calls p.resetSimulation()
+        # internally, then we reload the lightweight scene objects.
         self._aviary = VelocityAviary(
             drone_model=DroneModel.CF2X,
             num_drones=self.n_drones,
@@ -168,17 +169,9 @@ class PybulletHomeEnv(MultiAgentEnv):
             user_debug_gui=False,
         )
 
-        # Set camera once after the aviary has finished its own GUI init
+        # Camera is set after aviary.__init__ finishes its own GUI setup
         if self.gui:
             self._set_camera()
-
-        # Load scene objects once (they never move between episodes)
-        self._task_object_ids = []
-        self._tasks = [
-            _make_task(t, i, pos, steps)
-            for i, (t, pos, steps) in enumerate(self.task_layouts)
-        ]
-        self._load_scene()
 
     # ------------------------------------------------------------------
     # Gymnasium / RLlib interface
@@ -206,27 +199,21 @@ class PybulletHomeEnv(MultiAgentEnv):
         if seed is not None:
             np.random.seed(seed)
 
-        client = self._aviary.getPyBulletClient()
+        # aviary.reset() calls p.resetSimulation() which wipes the physics world
+        # and respawns drones at initial_xyzs with zeroed velocities/state.
+        self._aviary.reset()
 
-        # Soft-reset: reposition drones at spawn positions without closing the window
-        identity_quat = [0.0, 0.0, 0.0, 1.0]
-        zero_vel      = [0.0, 0.0, 0.0]
-        drone_ids = self._aviary.getDroneIds()
-        for i, drone_id in enumerate(drone_ids):
-            p.resetBasePositionAndOrientation(
-                drone_id, self._init_xyzs[i].tolist(), identity_quat,
-                physicsClientId=client,
-            )
-            p.resetBaseVelocity(
-                drone_id, zero_vel, zero_vel,
-                physicsClientId=client,
-            )
+        # resetSimulation removed our scene objects — reload them
+        self._task_object_ids = []
+        self._tasks = [
+            _make_task(t, i, pos, steps)
+            for i, (t, pos, steps) in enumerate(self.task_layouts)
+        ]
+        self._load_scene()
 
-        # Reset task logic — re-instantiate so progress counters are zeroed
-        for task in self._tasks:
-            task.reset()
-        # Restore task object visuals (completed tasks were greyed out)
-        self._restore_task_visuals()
+        # Re-apply camera (resetSimulation resets the debug visualiser too)
+        if self.gui:
+            self._set_camera()
 
         self._step_count = 0
         self._drone_task_map = {aid: None for aid in self._agent_ids}
@@ -250,18 +237,26 @@ class PybulletHomeEnv(MultiAgentEnv):
         rewards = {aid: REWARD_STEP_ALIVE for aid in self._agent_ids}
 
         # --- Convert policy actions → VelocityAviary format ---
-        # The policy outputs tanh-squashed values in [-1, 1] representing
-        # displacement per step in HomeEnv (MAX_SPEED=0.5 m/step).
-        # VelocityAviary expects velocity commands in m/s at ctrl_freq=48 Hz.
-        # Scale factor: HomeEnv step ≈ 0.5m, ctrl period = 1/48s
-        # → target_vel = action * MAX_SPEED * ctrl_freq = action * 0.5 * 48 = action * 24
-        # Clamp to a reasonable physical max (3 m/s) so the Crazyflie doesn't overshoot.
-        VEL_SCALE = 3.0   # m/s per unit action — matches Crazyflie's practical speed range
+        # VelocityAviary._preprocessAction() interprets action[k] as:
+        #   action[k, 0:3] = desired velocity direction vector (will be normalised)
+        #   action[k, 3]   = speed scalar in [0, 1] → target_vel = SPEED_LIMIT * speed * direction
+        #
+        # The policy outputs:
+        #   action[:3] = tanh-squashed displacement direction in [-1, 1]
+        #   action[3]  = sigmoid tool-engage signal in [0, 1]
+        #
+        # Mapping: pass policy[:3] as the direction, use its magnitude as speed.
+        # When the drone is moving toward a target, ||action[:3]|| ≈ 1 → full speed.
+        # tool_engage is tracked separately and NOT passed as speed.
         vel_cmds = np.zeros((self.n_drones, 4), dtype=np.float32)
         for i, aid in enumerate(agent_ids_sorted):
             action = action_dict.get(aid, np.zeros(self.ACT_DIM))
-            vel_cmds[i, :3] = np.clip(action[:3] * VEL_SCALE, -VEL_SCALE, VEL_SCALE)
-            vel_cmds[i, 3]  = 0.0          # keep yaw fixed
+            direction = action[:3].astype(np.float32)
+            norm = float(np.linalg.norm(direction))
+            vel_cmds[i, :3] = direction                     # VelocityAviary normalises this internally
+            # Use full speed (1.0) whenever the policy wants to move.
+            # Small tanh norms near the target would otherwise make the drone crawl.
+            vel_cmds[i, 3]  = 1.0 if norm > 0.05 else 0.0  # dead-band below 0.05 → hover
             self._tool_engaged[aid] = float(action[3]) > 0.5
 
         # --- Step the physics ---

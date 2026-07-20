@@ -8,6 +8,8 @@ env:
   room_size: [10.0, 10.0, 3.0]
   max_steps: 500
   coop_time_threshold: 0.7   # fraction of max_steps for coop bonus
+  # Note: PybulletHomeEnv deploy uses max_steps=2000 via --max-steps flag
+  # to give the real physics time to travel 10m at Crazyflie speeds
 
 model:
   obs_dim: 15
