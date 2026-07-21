@@ -37,17 +37,16 @@ training:
   total_timesteps: 5_000_000
   rollout_steps: 4096          # longer rollouts → better GAE value estimates
   mini_batch_size: 256
-  n_epochs: 5
+  n_epochs: 4
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
-  entropy_coef: 0.001          # very low: entropy was climbing 5.8→6.1 despite low lr
+  entropy_coef: 0.002          # slight increase: entropy collapsed to 4.7 (too little exploration)
   value_coef: 0.5
   max_grad_norm: 0.5
-  lr_actor: 3.0e-4             # raise now that reward scale is stable and sparse signal
-  lr_critic: 1.0e-3
-  normalise_rewards: false     # off: normalizer squashes task-completion spikes (+20)
-                               # into the proximity-noise floor (±1-3 per episode)
+  lr_actor: 5.0e-5             # halved: +14 rollout was blowing up the policy each time
+  lr_critic: 3.0e-4
+  normalise_rewards: false
   device: "auto"
 
 curriculum:

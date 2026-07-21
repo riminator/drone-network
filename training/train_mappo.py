@@ -205,7 +205,7 @@ def _save_checkpoint(
 # Main training loop
 # ---------------------------------------------------------------------------
 
-def train(cfg: dict, sim: str = "home"):
+def train(cfg: dict, sim: str = "home", resume_checkpoint: str | None = None):
     # Auto-detect best available device.
     # Priority: CUDA (Nvidia, Windows/Linux/Colab) → CPU
     # MPS (Apple Silicon) is intentionally skipped — benchmarked at only 1.05× CPU
@@ -241,6 +241,21 @@ def train(cfg: dict, sim: str = "home"):
 
     actor_optim = optim.Adam(actor.parameters(), lr=cfg["training"]["lr_actor"])
     critic_optim = optim.Adam(critic.parameters(), lr=cfg["training"]["lr_critic"])
+
+    # --- Resume from checkpoint (actor weights only) ---
+    update_count = 0
+    timesteps_collected = 0
+    if resume_checkpoint:
+        ckpt = torch.load(resume_checkpoint, map_location=device, weights_only=False)
+        actor.load_state_dict(ckpt["actor_state_dict"])
+        # Critic starts fresh — old critic was trained on different reward scale
+        update_count      = ckpt.get("update", 0)
+        timesteps_collected = ckpt.get("timesteps", 0)
+        print(
+            f"Resumed actor from {resume_checkpoint}\n"
+            f"  update={update_count}  timesteps={timesteps_collected:,}\n"
+            f"  (critic re-initialised — reward scale changed)"
+        )
 
     # --- Buffer ---
     buffer = RolloutBuffer(
@@ -286,8 +301,6 @@ def train(cfg: dict, sim: str = "home"):
     signal.signal(signal.SIGTERM, _handle_signal)
 
     # --- Training loop ---
-    update_count = 0
-    timesteps_collected = 0
     start_time = time.time()
 
     print(f"Starting MAPPO training — {total_timesteps:,} timesteps, {n_drones} drones")
@@ -446,6 +459,14 @@ if __name__ == "__main__":
         choices=["home", "mujoco"],
         help="Environment backend: 'home' (default, fast teleport) or 'mujoco' (physics)",
     )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="CHECKPOINT",
+        help="Resume actor weights from this .pt file (critic re-initialises). "
+             "Use the best checkpoint from a previous run, e.g. "
+             "checkpoints/actor_update345_interrupted.pt",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
-    train(cfg, sim=args.sim)
+    train(cfg, sim=args.sim, resume_checkpoint=args.resume)
