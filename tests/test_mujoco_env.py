@@ -231,7 +231,7 @@ class TestPhysics:
         env.step({"drone_0": np.zeros(4, dtype=np.float32)})
         b1 = env._batteries[0]
         assert b1 < b0, "battery should drain each step"
-        assert b1 == MAX_BATTERY - (MAX_BATTERY / 500)
+        assert b1 == MAX_BATTERY - (MAX_BATTERY / 700)
 
     def test_no_collision_with_zero_actions(self):
         """Drones start at staggered x positions — no initial collision."""

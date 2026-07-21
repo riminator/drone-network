@@ -120,8 +120,10 @@ _PID_KD_YAW   = 0.1 * _MAX_YAW_T
 # Effective control dt for PID derivative term
 _CTRL_DT      = 0.04   # s  (timestep × phys_steps = 0.002 × 20)
 
-# Battery drain: full charge lasts ~MAX_BATTERY env steps
-_BATTERY_DRAIN_PER_STEP = MAX_BATTERY / 500
+# Battery drain: full charge lasts longer than the longest episode (600 steps)
+# so drones never run flat mid-episode during training.
+# MAX_BATTERY / 700 → flat at step 700, well past max_steps=600.
+_BATTERY_DRAIN_PER_STEP = MAX_BATTERY / 700
 
 # Task engage distance: drone must be within this many metres.
 # Increased from 0.40 → 1.2 m because MuJoCo drones have real inertia and
@@ -451,7 +453,12 @@ class MujocoHomeEnv(MultiAgentEnv):
 
         # --- Battery drain --------------------------------------------
         for i in range(self._n_drones):
-            self._batteries[i] = max(0.0, self._batteries[i] - _BATTERY_DRAIN_PER_STEP)
+            prev = self._batteries[i]
+            self._batteries[i] = max(0.0, prev - _BATTERY_DRAIN_PER_STEP)
+            # One-shot penalty on the step the battery first hits zero
+            if prev > 0 and self._batteries[i] <= 0:
+                aid = f"drone_{i}"
+                rewards[aid] += REWARD_BATTERY_DEAD
 
         # --- Reward: alive penalty ------------------------------------
         for aid in self._agent_ids:
@@ -463,11 +470,6 @@ class MujocoHomeEnv(MultiAgentEnv):
             aid_i, aid_j = f"drone_{i}", f"drone_{j}"
             rewards[aid_i] += REWARD_COLLISION
             rewards[aid_j] += REWARD_COLLISION
-
-        # --- Battery dead penalty ------------------------------------
-        for i, aid in enumerate(sorted(self._agent_ids)):
-            if self._batteries[i] <= 0:
-                rewards[aid] += REWARD_BATTERY_DEAD
 
         # --- Task progress + dense proximity shaping -----------------
         tasks_done_before = sum(1 for t in self._tasks if t.completed)
