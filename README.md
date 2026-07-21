@@ -298,29 +298,37 @@ python3 -m evaluation.eval_allocation \
 
 ---
 
-### 4 — MuJoCo physics lab (recommended)
+### 4 — MuJoCo physics lab
+
+> **Checkpoint note:** use `actor_update500.pt` for MuJoCo (trained end-to-end in
+> the physics sim). `actor_update204_final.pt` is the HomeEnv policy — it will
+> navigate but won't reliably complete tasks due to different kinematics.
 
 ```bash
-# MuJoCo viewer — greedy allocator
-python3 -m lab.deploy \
-    --sim mujoco \
-    --checkpoint checkpoints/actor_update204_final.pt
-
-# MuJoCo — learned bidder + viewer
-python3 -m lab.deploy \
-    --sim mujoco \
-    --checkpoint     checkpoints/actor_update204_final.pt \
-    --allocator      learned \
-    --bid-checkpoint checkpoints/bid_policy_final.pt
-
-# MuJoCo headless (no GUI) — fast benchmark
+# MuJoCo headless (recommended — no mjpython required)
 python3 -m lab.deploy \
     --sim mujoco --no-gui \
-    --checkpoint checkpoints/actor_update204_final.pt \
-    --allocator cbba --episodes 10
+    --checkpoint checkpoints/actor_update500.pt \
+    --allocator greedy --episodes 5
+
+# MuJoCo — learned bidder, headless
+python3 -m lab.deploy \
+    --sim mujoco --no-gui \
+    --checkpoint     checkpoints/actor_update500.pt \
+    --allocator      learned \
+    --bid-checkpoint checkpoints/bid_policy_final.pt \
+    --episodes 5
+
+# MuJoCo GUI (macOS: must use mjpython, not python3)
+mjpython -m lab.deploy \
+    --sim mujoco \
+    --checkpoint checkpoints/actor_update500.pt
 ```
 
 **MuJoCo viewer controls:** Right-click + drag to rotate · scroll to zoom · double-click a body to track it.
+
+**On macOS** running `python3 -m lab.deploy --sim mujoco` without `mjpython` silently
+falls back to headless and prints the correct `mjpython` command.
 
 ---
 
@@ -387,16 +395,29 @@ python3 -m lab.deploy \
 
 Skip these if you already have the checkpoints.
 
-**Phase 1 — execution actor (MAPPO):**
+**Phase 1 — HomeEnv execution actor (MAPPO, fast teleport sim):**
 
 ```bash
-# Default config (~5M steps, ~4–8h on GPU)
+# ~5M steps, ~40 min on CPU  (this produced actor_update204_final.pt)
 python3 -m training.train_mappo --config training/config.yaml
 
-# With W&B logging
-python3 -m training.train_mappo --config training/config.yaml --wandb
-
 # Press Ctrl+C at any time — saves checkpoint cleanly
+# Output: checkpoints/actor_update<N>_final.pt
+```
+
+**Phase 1b — MuJoCo execution actor (physics sim, ~40 min on CPU):**
+
+```bash
+# Train from scratch in MuJoCo physics
+python3 -m training.train_mappo \
+    --config training/config_mujoco.yaml \
+    --sim mujoco
+
+# Fine-tune from an existing MuJoCo checkpoint (recommended)
+python3 -m training.train_mappo \
+    --config training/config_mujoco.yaml \
+    --sim mujoco \
+    --resume checkpoints/actor_update500.pt
 # Output: checkpoints/actor_update<N>_final.pt
 ```
 
@@ -406,11 +427,6 @@ python3 -m training.train_mappo --config training/config.yaml --wandb
 # Uses the harder 7-task layout in config_bid.yaml (~400 updates, ~2–4h on GPU)
 python3 -m training.train_bid_policy \
     --config training/config_bid.yaml \
-    --exec-checkpoint checkpoints/actor_update204_final.pt
-
-# With default config (5-task layout, faster)
-python3 -m training.train_bid_policy \
-    --config training/config.yaml \
     --exec-checkpoint checkpoints/actor_update204_final.pt
 
 # Press Ctrl+C — saves checkpoint cleanly
@@ -462,17 +478,29 @@ print(policy.marginal_bid_numpy(obs_vec))  # marginal co-assignment bid ∈ (0, 
 
 ---
 
-## Quick Reference — Checkpoint Arguments
+## Quick Reference — Checkpoint Map
 
-Every command that uses trained weights takes two distinct flags:
+| File | Env | Updates | Tasks/ep | Use for |
+|---|---|---|---|---|
+| `actor_update204_final.pt` | HomeEnv | 204 (5M steps) | ~7/7 | allocation benchmark, PyBullet deploy |
+| `actor_update500.pt` | MuJoCo | 500 (4M steps) | ~1/7 | MuJoCo physics demo |
+| `bid_policy_final.pt` | HomeEnv | 400 | — | `--allocator learned` in any env |
+
+**Do not mix environments:** `actor_update204_final.pt` was trained with teleport
+kinematics (HomeEnv) — it works in PyBullet/HomeEnv but is unreliable in MuJoCo.
+`actor_update500.pt` was trained in MuJoCo physics and only deploys correctly there.
+
+**Flag reference:**
 
 | Flag | File | Purpose |
 |---|---|---|
-| `--exec-checkpoint` | `checkpoints/actor_update204_final.pt` | Execution actor — drives drone movement |
-| `--checkpoint` | `checkpoints/bid_policy_final.pt` | Bid policy — drives task allocation |
-| `--bid-checkpoint` | `checkpoints/bid_policy_final.pt` | Same file, used in `lab/deploy.py` |
+| `--exec-checkpoint` | `actor_update204_final.pt` | Execution actor (eval_allocation.py) |
+| `--checkpoint` | `bid_policy_final.pt` | Bid policy (eval_allocation.py, train_bid_policy.py) |
+| `--bid-checkpoint` | `bid_policy_final.pt` | Same file (lab/deploy.py) |
+| `--resume` | any actor `.pt` | Warm-start train_mappo.py actor weights |
 
-**Common mistake:** passing the bid policy to `--exec-checkpoint` (or vice versa) gives a `KeyError: 'actor_state_dict'` — the keys in each checkpoint file are different.
+**Common mistake:** passing the bid policy to `--exec-checkpoint` (or vice versa) gives
+a `KeyError: 'actor_state_dict'` — the keys in each checkpoint file are different.
 
 ---
 
