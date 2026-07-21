@@ -27,10 +27,14 @@ def load_checkpoint(path: str, cfg_override: dict | None = None) -> tuple[Actor,
     """Load actor + critic weights from a training checkpoint."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
-    # Defaults — override per your training config if needed
     obs_dim = (cfg_override or {}).get("obs_dim", 15)
     act_dim = (cfg_override or {}).get("act_dim", 4)
-    n_drones = (cfg_override or {}).get("n_drones", 3)
+
+    # Infer n_drones from the critic's first-layer weight shape rather than
+    # relying on the caller passing the right value.  The critic input dim is
+    # n_drones * obs_dim, so: n_drones = input_dim / obs_dim.
+    critic_input_dim = ckpt["critic_state_dict"]["net.0.weight"].shape[1]
+    n_drones = critic_input_dim // obs_dim
 
     actor = Actor(obs_dim=obs_dim, act_dim=act_dim)
     actor.load_state_dict(ckpt["actor_state_dict"])
@@ -42,7 +46,8 @@ def load_checkpoint(path: str, cfg_override: dict | None = None) -> tuple[Actor,
 
     print(
         f"Loaded checkpoint: update={ckpt.get('update', '?')} "
-        f"timesteps={ckpt.get('timesteps', '?'):,}"
+        f"timesteps={ckpt.get('timesteps', '?'):,} "
+        f"(n_drones={n_drones} inferred from checkpoint)"
     )
     return actor, critic, ckpt
 
@@ -141,15 +146,16 @@ if __name__ == "__main__":
     parser.add_argument("--render", action="store_true", help="Print ASCII render each step")
     parser.add_argument("--step-delay", type=float, default=0.0,
                         help="Seconds to sleep between steps when rendering")
-    parser.add_argument("--n-drones", type=int, default=3)
+    parser.add_argument("--n-drones", type=int, default=6,
+                        help="Number of drones (default: 6)")
     args = parser.parse_args()
 
-    actor, _, _ = load_checkpoint(
-        args.checkpoint, cfg_override={"n_drones": args.n_drones}
-    )
+    actor, _, _ = load_checkpoint(args.checkpoint)
 
+    from allocator.greedy_auction import GreedyAuction
     env = HomeEnv(config={
         "n_drones": args.n_drones,
+        "allocator": GreedyAuction(),
         "render_mode": "human" if args.render else None,
     })
 

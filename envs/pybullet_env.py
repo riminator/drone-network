@@ -28,6 +28,8 @@ from typing import Any
 
 import numpy as np
 
+from allocator.base_allocator import BaseAllocator, WorldSnapshot, AllocationResult, Bid
+
 try:
     from ray.rllib.env.multi_agent_env import MultiAgentEnv
 except ImportError:
@@ -45,7 +47,40 @@ except ImportError:
 from gymnasium import spaces
 from envs.drone_agent import DroneAgent, MAX_BATTERY
 from envs.tasks import WaterPlantTask, SweepFloorTask, ToggleLightTask
-from envs.tasks.base_task import TaskSpec
+from envs.tasks.base_task import TaskSpec, TaskStatus
+
+
+# ---------------------------------------------------------------------------
+# Built-in greedy fallback — mirrors HomeEnv._GreedyFallbackAllocator so
+# PybulletHomeEnv works identically to the old hard-coded _assign_tasks when
+# no external allocator is supplied.
+# ---------------------------------------------------------------------------
+
+class _GreedyFallbackAllocator(BaseAllocator):
+    def allocate(self, snapshot: WorldSnapshot) -> AllocationResult:
+        active = {TaskStatus.PENDING, TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS}
+        claimed: set[int] = {
+            idx for idx in snapshot.current_assignments.values()
+            if idx is not None
+        }
+        pending = [
+            i for i, t in enumerate(snapshot.tasks)
+            if not t.completed and t.status in active and i not in claimed
+        ]
+        assignments: dict[str, int | None] = {}
+        for drone_id in sorted(snapshot.drone_positions):
+            existing = snapshot.current_assignments.get(drone_id)
+            if (
+                existing is not None
+                and existing < len(snapshot.tasks)
+                and not snapshot.tasks[existing].completed
+            ):
+                assignments[drone_id] = existing
+            elif pending:
+                assignments[drone_id] = pending.pop(0)
+            else:
+                assignments[drone_id] = None
+        return AllocationResult(assignments=assignments)
 
 # ---------------------------------------------------------------------------
 # Asset paths
@@ -147,14 +182,20 @@ class PybulletHomeEnv(MultiAgentEnv):
             )
 
         config = config or {}
-        self.n_drones: int        = config.get("n_drones", 3)
-        self.room_size: list      = config.get("room_size", [10.0, 10.0, 3.0])
-        self.max_steps: int       = config.get("max_steps", 500)
-        self.task_layouts: list   = config.get("task_layouts", _DEFAULT_TASK_LAYOUTS)
-        self.gui: bool            = config.get("gui", True)
-        self.record: bool         = config.get("record", False)
-        self.coop_time_threshold  = config.get("coop_time_threshold", 0.7)
-        self.time_scale: float    = config.get("time_scale", 1.0)
+        self.n_drones: int           = config.get("n_drones", 3)
+        self.room_size: list         = config.get("room_size", [10.0, 10.0, 3.0])
+        self.max_steps: int          = config.get("max_steps", 500)
+        self.task_layouts: list      = config.get("task_layouts", _DEFAULT_TASK_LAYOUTS)
+        self.gui: bool               = config.get("gui", True)
+        self.record: bool            = config.get("record", False)
+        self.coop_time_threshold     = config.get("coop_time_threshold", 0.7)
+        self.time_scale: float       = config.get("time_scale", 1.0)
+        # Pluggable auction allocator (same interface as HomeEnv)
+        self.allocator: BaseAllocator = config.get(
+            "allocator", _GreedyFallbackAllocator()
+        )
+        # Re-run the auction every this many steps (0 = only on task completion)
+        self.auction_interval: int    = config.get("auction_interval", 0)
 
         self._agent_ids = {f"drone_{i}" for i in range(self.n_drones)}
         if hasattr(super(), "__init__"):
@@ -182,6 +223,10 @@ class PybulletHomeEnv(MultiAgentEnv):
         self._debug_task_lines: dict[str, int] = {}    # aid → debug line item id
         self._debug_hud_id: int = -1                    # single HUD text item
         self._debug_key_hint_id: int = -1               # key-bindings reminder text
+        # Bid visualisation — one line per (drone, task) pair, keyed by (aid, task_idx)
+        self._debug_bid_lines: dict[tuple[str, int], int] = {}
+        # Most recent bids from the last allocation round (empty until first alloc)
+        self._last_bids: list[Bid] = []
 
         # Visual-override shape IDs — large coloured discs that replace the tiny
         # Crazyflie mesh so drones are visible at room scale.  Rebuilt after each
@@ -354,6 +399,8 @@ class PybulletHomeEnv(MultiAgentEnv):
         self._debug_task_lines   = {}
         self._debug_hud_id       = -1
         self._debug_key_hint_id  = -1
+        self._debug_bid_lines    = {}
+        self._last_bids          = []
 
         # resetSimulation removed our scene objects — reload them
         self._task_object_ids = []
@@ -372,7 +419,7 @@ class PybulletHomeEnv(MultiAgentEnv):
         self._step_count = 0
         self._drone_task_map = {aid: None for aid in self._agent_ids}
         self._tool_engaged   = {aid: False for aid in self._agent_ids}
-        self._assign_tasks()
+        self._assign_tasks(self._aviary.pos)
 
         obs = self._build_obs_dict()
         return obs, {}
@@ -428,8 +475,13 @@ class PybulletHomeEnv(MultiAgentEnv):
                     rewards[agent_ids_sorted[i]] += REWARD_COLLISION
                     rewards[agent_ids_sorted[j]] += REWARD_COLLISION
 
-        # --- Task progress using real PyBullet positions ---
+        # --- Periodic auction tick (runs before task progress so new assignments
+        #     take effect this step, matching HomeEnv's allocate-then-step order) ---
         real_positions = self._aviary.pos   # shape (n_drones, 3)
+        if self.auction_interval > 0 and self._step_count % self.auction_interval == 0:
+            self._assign_tasks(real_positions)
+
+        # --- Task progress using real PyBullet positions ---
         for i, aid in enumerate(agent_ids_sorted):
             task_idx = self._drone_task_map.get(aid)
             if task_idx is None:
@@ -437,7 +489,7 @@ class PybulletHomeEnv(MultiAgentEnv):
             task = self._tasks[task_idx]
             if task.completed:
                 self._drone_task_map[aid] = None
-                self._assign_tasks()
+                self._assign_tasks(real_positions)
                 continue
 
             delta = task.step(real_positions[i], self._tool_engaged[aid])
@@ -447,7 +499,7 @@ class PybulletHomeEnv(MultiAgentEnv):
                 rewards[aid] += task.completion_reward()
                 self._update_task_visual(task_idx, completed=True)
                 self._drone_task_map[aid] = None
-                self._assign_tasks()
+                self._assign_tasks(real_positions)
 
         # --- Cooperative bonus ---
         if all(t.completed for t in self._tasks):
@@ -472,6 +524,7 @@ class PybulletHomeEnv(MultiAgentEnv):
         if self.gui:
             self._handle_camera_keys(real_positions)
             self._update_debug_visuals(real_positions, agent_ids_sorted)
+            self._draw_bid_lines(real_positions, agent_ids_sorted)
 
         return obs, rewards, terminated, truncated, infos
 
@@ -616,6 +669,97 @@ class PybulletHomeEnv(MultiAgentEnv):
             replaceItemUniqueId=self._debug_key_hint_id if self._debug_key_hint_id != -1 else -1,
             physicsClientId=client,
         )
+
+    def _draw_bid_lines(
+        self,
+        real_positions: np.ndarray,
+        agent_ids_sorted: list[str],
+    ) -> None:
+        """
+        Draw (or update) one thin debug line per bid in ``self._last_bids``.
+
+        Colour encodes normalised bid value:
+          0.0  →  red   [1.0, 0.1, 0.1]
+          0.5  →  yellow [1.0, 1.0, 0.1]
+          1.0  →  green  [0.1, 1.0, 0.1]
+
+        Only the top-N bids per drone are shown (N = BID_LINES_PER_DRONE) to
+        avoid visual clutter when there are many tasks.  Lines for (drone, task)
+        pairs that have fallen out of the current bid list are removed.
+        """
+        if not self._last_bids or not self.gui:
+            return
+
+        client = self._aviary.getPyBulletClient()
+
+        # Normalise bid values across the current round so the colour span is full
+        vals = [b.bid_value for b in self._last_bids]
+        lo, hi = min(vals), max(vals)
+        span = hi - lo if hi > lo else 1.0
+
+        def _bid_colour(v: float) -> list[float]:
+            """Linear red→yellow→green for t ∈ [0, 1]."""
+            t = (v - lo) / span
+            if t < 0.5:
+                # red → yellow
+                s = t * 2.0
+                return [1.0, s, 0.1]
+            else:
+                # yellow → green
+                s = (t - 0.5) * 2.0
+                return [1.0 - s, 1.0, 0.1]
+
+        # Keep only the highest-value bid per drone (one line = current winner)
+        best_bid_per_drone: dict[str, "Bid"] = {}
+        for b in self._last_bids:
+            prev = best_bid_per_drone.get(b.drone_id)
+            if prev is None or b.bid_value > prev.bid_value:
+                best_bid_per_drone[b.drone_id] = b
+
+        active_keys: set[tuple[str, int]] = set()
+
+        for drone_id, b in best_bid_per_drone.items():
+            task_idx = b.task_idx
+            if task_idx >= len(self._tasks) or self._tasks[task_idx].completed:
+                continue
+
+            task = self._tasks[task_idx]
+            task_target: list[float]
+            if isinstance(task, SweepFloorTask):
+                task_target = task.current_target.tolist()
+            else:
+                task_target = task.spec.target_position.tolist()
+
+            # Drone position: use aviary real position when available
+            try:
+                di = agent_ids_sorted.index(drone_id)
+                drone_pos = real_positions[di].tolist()
+            except ValueError:
+                continue
+
+            colour = _bid_colour(b.bid_value)
+            key = (drone_id, task_idx)
+            prev_id = self._debug_bid_lines.get(key, -1)
+            item_id = p.addUserDebugLine(
+                drone_pos,
+                task_target,
+                lineColorRGB=colour,
+                lineWidth=1.5,
+                replaceItemUniqueId=prev_id if prev_id != -1 else -1,
+                physicsClientId=client,
+            )
+            self._debug_bid_lines[key] = item_id
+            active_keys.add(key)
+
+        # Remove stale lines for (drone, task) pairs no longer in the top bids
+        stale = [k for k in self._debug_bid_lines if k not in active_keys]
+        for key in stale:
+            item_id = self._debug_bid_lines.pop(key)
+            if item_id != -1:
+                try:
+                    p.removeUserDebugItem(item_id, physicsClientId=client)
+                except Exception:
+                    pass  # item may already be gone after resetSimulation
 
     def close(self):
         if self._aviary is not None:
@@ -845,20 +989,68 @@ class PybulletHomeEnv(MultiAgentEnv):
         }
 
     # ------------------------------------------------------------------
-    # Task assignment
+    # Task assignment — auction-backed
     # ------------------------------------------------------------------
 
-    def _assign_tasks(self):
-        claimed = {idx for idx in self._drone_task_map.values() if idx is not None}
-        pending = [
-            i for i, t in enumerate(self._tasks)
-            if not t.completed and i not in claimed
-        ]
-        for aid in sorted(self._agent_ids):
-            if self._drone_task_map[aid] is None and pending:
-                task_idx = pending.pop(0)
-                self._drone_task_map[aid] = task_idx
-                self._tasks[task_idx].assigned_drone_id = aid
+    def _assign_tasks(self, real_positions: np.ndarray | None = None) -> None:
+        """
+        Build a WorldSnapshot from current sim state, run the allocator,
+        and apply the resulting assignments.
+
+        ``real_positions`` is the aviary.pos array (n_drones × 3).  If None
+        (only during the very first reset() call before the aviary exists), we
+        fall back to the static initial positions.
+        """
+        agent_ids_sorted = sorted(self._agent_ids)
+
+        # Drone positions: prefer live physics positions; fall back to init grid
+        if real_positions is not None:
+            positions = {
+                aid: real_positions[i].astype(np.float32)
+                for i, aid in enumerate(agent_ids_sorted)
+            }
+        else:
+            positions = {
+                aid: self._init_xyzs[i].astype(np.float32)
+                for i, aid in enumerate(agent_ids_sorted)
+            }
+
+        # Battery: PybulletHomeEnv has no battery model — report full (1.0)
+        batteries = {aid: 1.0 for aid in self._agent_ids}
+        progress  = {aid: 0.0 for aid in self._agent_ids}
+
+        # Task statuses: sync completed → COMPLETE so the allocator skips them
+        for task in self._tasks:
+            if task.completed and task.status != TaskStatus.COMPLETE:
+                task.status = TaskStatus.COMPLETE
+
+        snapshot = WorldSnapshot(
+            drone_positions=positions,
+            drone_batteries=batteries,
+            drone_task_progress=progress,
+            current_assignments=dict(self._drone_task_map),
+            tasks=self._tasks,
+            step=self._step_count,
+            max_steps=self.max_steps,
+        )
+
+        result = self.allocator.allocate(snapshot)
+        self._last_bids = result.bids  # stored for bid-line visualisation
+
+        # Apply assignments
+        # Clear all task assignee lists first (mirrors HomeEnv._apply_allocation)
+        for task in self._tasks:
+            task.assigned_drone_ids = []
+
+        for aid, task_idx in result.assignments.items():
+            self._drone_task_map[aid] = task_idx
+            if task_idx is None:
+                continue
+            task = self._tasks[task_idx]
+            if aid not in task.assigned_drone_ids:
+                task.assigned_drone_ids.append(aid)
+            if task.status == TaskStatus.PENDING:
+                task.status = TaskStatus.ASSIGNED
 
     def _get_init_positions(self) -> np.ndarray:
         """Spread drones along one wall at hover height."""

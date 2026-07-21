@@ -1,0 +1,58 @@
+# ============================================================
+# Bid Policy Training Configuration
+# Separate from config.yaml so the MAPPO config is never touched.
+#
+# Switch back to the old setup at any time:
+#   python -m training.train_bid_policy --config training/config.yaml
+# ============================================================
+
+# --- Environment used during bid-policy rollout collection ---
+# 3 drones + 7 tasks creates genuine allocation pressure:
+# drones cannot all be assigned at once, so bidding decisions matter.
+# The two extra water_plant + sweep tasks are what make greedy fail
+# on surge/congestion scenarios — giving the learned bidder real signal.
+env:
+  n_drones: 3
+  room_size: [10.0, 10.0, 3.0]
+  max_steps: 500
+  coop_time_threshold: 0.7
+  obs_noise_std: 0.25
+  task_layouts:
+    - ["water_plant",  [2.0, 3.0, 1.0], 10, false]
+    - ["water_plant",  [7.0, 1.5, 1.0], 10, false]
+    - ["water_plant",  [3.0, 7.0, 1.0], 10, false]   # extra — creates congestion
+    - ["sweep_floor",  [5.0, 5.0, 0.3], 15, true]
+    - ["sweep_floor",  [2.0, 8.0, 0.3], 15, true]    # extra — shareable, tests co-assign
+    - ["toggle_light", [9.0, 0.5, 2.5],  1, false]
+    - ["toggle_light", [0.5, 9.0, 2.5],  1, false]
+
+# training.device is the only key train_bid_policy.py reads from this section
+training:
+  device: "auto"
+
+# --- Bid policy hyperparameters ---
+# lr raised 3e-4 → 1e-3 to unblock the dead hidden layers.
+# weight_decay added to stop output norm growing without bound.
+# n_updates raised to 400 (more signal needed on harder episodes).
+# episodes_per_update raised to 12 (more diverse rollouts per update).
+bid_policy:
+  hidden: [64, 64]
+  lr: 1.0e-3              # was 3e-4 — higher to unblock hidden-layer learning
+  lr_value: 1.0e-3
+  weight_decay: 1.0e-4    # prevents output weight norm growing unbounded
+  log_std_init: -1.0
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  n_epochs: 4
+  mini_batch_size: 256
+  gamma: 0.99
+  gae_lambda: 0.95
+  n_updates: 400          # was 200 — harder task set needs more updates
+  episodes_per_update: 12 # was 8  — wider rollout variance per update
+  eval_interval: 20
+  checkpoint_interval: 50
+
+logging:
+  checkpoint_dir: "checkpoints"

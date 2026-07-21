@@ -265,7 +265,11 @@ def train(cfg: dict, exec_checkpoint: str):
     policy    = BidPolicy(obs_dim=BID_OBS_DIM, hidden=bp_cfg.get("hidden", [64, 64])).to(device)
     value_net = BidValueNet(obs_dim=BID_OBS_DIM, hidden=bp_cfg.get("hidden", [64, 64])).to(device)
 
-    policy_optim = optim.Adam(policy.parameters(), lr=bp_cfg["lr"])
+    policy_optim = optim.Adam(
+        policy.parameters(),
+        lr=bp_cfg["lr"],
+        weight_decay=bp_cfg.get("weight_decay", 0.0),
+    )
     value_optim  = optim.Adam(value_net.parameters(), lr=bp_cfg["lr_value"])
 
     ckpt_dir = Path(cfg["logging"]["checkpoint_dir"])
