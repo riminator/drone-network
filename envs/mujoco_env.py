@@ -491,10 +491,12 @@ class MujocoHomeEnv(MultiAgentEnv):
             rewards[aid] += REWARD_PROXIMITY_SCALE * delta
             self._prev_dist[key] = dist
 
-            act = actions.get(aid, np.zeros(self.ACT_DIM))
-            tool_engaged = float(act[3]) > 0.5
+            # tool_engaged: auto-engage when within range so the policy only
+            # needs to learn navigation, not a separate tool-toggle signal.
+            # action[3] is kept in the obs/action space for compatibility but
+            # proximity alone is sufficient to trigger task progress.
             if dist < _ENGAGE_DIST:
-                task.step(drone_position=pos, tool_engaged=tool_engaged)
+                task.step(drone_position=pos, tool_engaged=True)
                 if task.completed:
                     rewards[aid] += REWARD_TASK_COMPLETE
 
