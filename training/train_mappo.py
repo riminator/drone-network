@@ -1,10 +1,11 @@
 """
 train_mappo.py
-Main training loop for MAPPO on the HomeEnv drone swarm.
+Main training loop for MAPPO on the HomeEnv (or MujocoHomeEnv) drone swarm.
 
 Run:
     python -m training.train_mappo
     python -m training.train_mappo --config training/config.yaml
+    python -m training.train_mappo --config training/config_mujoco.yaml --sim mujoco
     python -m training.train_mappo --config training/config.yaml --wandb
 
 Architecture:
@@ -29,6 +30,7 @@ import torch.optim as optim
 import yaml
 
 from envs.home_env import HomeEnv
+from envs.mujoco_env import MujocoHomeEnv
 from models.actor import Actor
 from models.critic import CentralCritic
 from utils.replay_buffer import RolloutBuffer
@@ -203,7 +205,7 @@ def _save_checkpoint(
 # Main training loop
 # ---------------------------------------------------------------------------
 
-def train(cfg: dict):
+def train(cfg: dict, sim: str = "home"):
     # Auto-detect best available device.
     # Priority: CUDA (Nvidia, Windows/Linux/Colab) → CPU
     # MPS (Apple Silicon) is intentionally skipped — benchmarked at only 1.05× CPU
@@ -217,7 +219,10 @@ def train(cfg: dict):
     total_timesteps = cfg["training"]["total_timesteps"]
 
     # --- Environment ---
-    env = HomeEnv(config=cfg["env"])
+    if sim == "mujoco":
+        env = MujocoHomeEnv(config=cfg["env"])
+    else:
+        env = HomeEnv(config=cfg["env"])
     obs_dict, _ = env.reset()
     agent_ids = sorted(env._agent_ids)
 
@@ -435,6 +440,12 @@ if __name__ == "__main__":
         default="training/config.yaml",
         help="Path to YAML config file",
     )
+    parser.add_argument(
+        "--sim",
+        default="home",
+        choices=["home", "mujoco"],
+        help="Environment backend: 'home' (default, fast teleport) or 'mujoco' (physics)",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
-    train(cfg)
+    train(cfg, sim=args.sim)

@@ -465,8 +465,10 @@ class MujocoHomeEnv(MultiAgentEnv):
                 continue
             pos = self._get_drone_pos(i)
             dist = np.linalg.norm(pos - task.spec.target_position)
+            act = actions.get(aid, np.zeros(self.ACT_DIM))
+            tool_engaged = float(act[3]) > 0.5
             if dist < _ENGAGE_DIST:
-                task.step(drone_id=aid, drone_position=pos)
+                task.step(drone_position=pos, tool_engaged=tool_engaged)
                 if task.completed:
                     rewards[aid] += task.spec.engage_steps_required * 0.2
 
@@ -613,11 +615,17 @@ class MujocoHomeEnv(MultiAgentEnv):
         thrust = float(np.clip(thrust, 0.0, _MAX_F))
 
         # -- Horizontal velocity → desired lean angle --------------------
+        # Coordinate frame: x=East, y=North, z=Up (MuJoCo scene convention).
+        # To accelerate in +x: nose pitches DOWN → negative pitch angle, but
+        # the positive-pitch-torque convention in MuJoCo moves the drone in -x.
+        # We therefore negate both lean-angle signs relative to the naive formula:
+        #   pitch_des = +vx_body / V_MAX * 0.40  (nose down → moves +x)
+        #   roll_des  = -vy_body / V_MAX * 0.40  (left-side down → moves +y)
         cy, sy = np.cos(yaw), np.sin(yaw)
         vx_body =  cy * vx_des + sy * vy_des
         vy_body = -sy * vx_des + cy * vy_des
-        roll_des  =  vy_body / (V_MAX + 1e-6) * 0.40   # max ~23 deg lean
-        pitch_des = -vx_body / (V_MAX + 1e-6) * 0.40
+        roll_des  = -vy_body / (V_MAX + 1e-6) * 0.40   # left-side down → +y
+        pitch_des =  vx_body / (V_MAX + 1e-6) * 0.40   # nose down → +x
 
         # -- Roll PD (angle-mode, outputs Nm) ----------------------------
         roll_err    = roll_des - roll
@@ -666,51 +674,59 @@ class MujocoHomeEnv(MultiAgentEnv):
         self._data.ctrl[base + 3] =  prop_spin   # CW
 
     def _build_obs(self) -> dict[str, np.ndarray]:
-        """Build 15-dim observation for each drone (same as DroneAgent)."""
+        """
+        Build the 15-dim observation matching DroneAgent.get_observation() exactly.
+
+        Layout (must match training env):
+            [0:3]   position (x, y, z)
+            [3]     battery normalised (0-1)
+            [4]     task_progress (0-1)
+            [5:8]   task_rel = target_pos - drone_pos  (zeros if no task)
+            [8:11]  velocity (vx, vy, vz)
+            [11]    tool_engaged (0/1) — always 0 in MuJoCo (no tool model)
+            [12:15] nearest neighbour relative position (zeros if only drone)
+        """
         obs_dict: dict[str, np.ndarray] = {}
         n = self._n_drones
-        positions = [self._get_drone_pos(i) for i in range(n)]
+        positions  = [self._get_drone_pos(i) for i in range(n)]
         velocities = [self._get_drone_vel(i) for i in range(n)]
 
         for i, aid in enumerate(sorted(self._agent_ids)):
-            pos   = positions[i]
-            vel   = velocities[i]
+            pos = positions[i]
+            vel = velocities[i]
 
-            # Nearest task info
+            # Task vector
             task_idx = self._drone_task_map.get(aid)
             if task_idx is not None and task_idx < len(self._tasks):
-                task     = self._tasks[task_idx]
-                task_pos = task.spec.target_position
-                task_rel = task_pos - pos
-                rem      = task.remaining_work() / max(task.spec.engage_steps_required, 1)
+                task         = self._tasks[task_idx]
+                task_rel     = (task.spec.target_position - pos).astype(np.float32)
+                task_progress = 1.0 - task.remaining_work() / max(task.spec.engage_steps_required, 1)
             else:
-                task_rel = np.zeros(3, dtype=np.float32)
-                rem      = 0.0
+                task_rel      = np.zeros(3, dtype=np.float32)
+                task_progress = 0.0
 
-            # Nearest other drone (for collision avoidance)
-            nearest_rel = np.zeros(3, dtype=np.float32)
+            # Nearest other drone
+            nearest_pos = np.zeros(3, dtype=np.float32)
             nearest_dist = np.inf
             for j in range(n):
                 if j == i:
                     continue
-                d = positions[j] - pos
-                dist = np.linalg.norm(d)
-                if dist < nearest_dist:
-                    nearest_dist = dist
-                    nearest_rel  = d
+                d = np.linalg.norm(positions[j] - pos)
+                if d < nearest_dist:
+                    nearest_dist = d
+                    nearest_pos  = positions[j].astype(np.float32)
 
             battery_norm = self._batteries[i] / MAX_BATTERY
 
-            # 15-dim vector: [pos(3), vel(3), task_rel(3), rem(1), nearest_rel(3), battery(1), step_frac(1)]
-            raw = np.concatenate([
-                pos.astype(np.float32),
-                vel.astype(np.float32),
-                task_rel.astype(np.float32),
-                [float(rem)],
-                nearest_rel.astype(np.float32),
-                [float(battery_norm)],
-                [float(self._step_count / self._max_steps)],
-            ]).astype(np.float32)
+            # Assemble in DroneAgent order
+            raw = np.zeros(self.OBS_DIM, dtype=np.float32)
+            raw[0:3]  = pos.astype(np.float32)
+            raw[3]    = battery_norm
+            raw[4]    = task_progress
+            raw[5:8]  = task_rel                   # target - pos
+            raw[8:11] = vel.astype(np.float32)
+            raw[11]   = 0.0                        # tool_engaged — not modelled
+            raw[12:15] = nearest_pos - pos         # neighbour relative pos
 
             if self._noise_std > 0:
                 raw += np.random.normal(0, self._noise_std, raw.shape).astype(np.float32)

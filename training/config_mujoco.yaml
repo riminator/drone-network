@@ -1,0 +1,79 @@
+# ============================================================
+# MAPPO Training Configuration — MuJoCo 3 physics backend
+#
+# Usage:
+#   python -m training.train_mappo \
+#       --config training/config_mujoco.yaml --sim mujoco
+#
+# Key differences from config.yaml (HomeEnv):
+#   - 3 drones (scene XML has 3 bodies; avoids XML rebuild)
+#   - max_steps=600: physics takes real time to traverse 10m
+#   - obs_noise_std=0.05: MuJoCo sensors already have physics
+#     variability; heavy extra noise hurts z-climb learning
+#   - rollout_steps=2048: shorter rollouts surface early signals
+#   - total_timesteps=3_000_000: MuJoCo @ ~2000 steps/sec on
+#     CPU → ~25 min; CUDA would be ~5 min
+#   - curriculum disabled: physics env is already hard enough
+# ============================================================
+
+env:
+  n_drones: 3
+  max_steps: 600
+  obs_noise_std: 0.05          # light sensor noise (physics already noisy)
+  coop_time_threshold: 0.7
+
+model:
+  obs_dim: 15
+  act_dim: 4
+  actor_hidden: [256, 256]
+  critic_hidden: [512, 256]
+
+training:
+  total_timesteps: 3_000_000
+  rollout_steps: 2048           # shorter rollouts → faster signal from task completions
+  mini_batch_size: 256
+  n_epochs: 5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.01            # slightly higher entropy: encourages altitude exploration
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  lr_actor: 3.0e-4              # standard rate: MuJoCo policy starts from scratch
+  lr_critic: 1.0e-3
+  normalise_rewards: true
+  device: "auto"
+
+curriculum:
+  enabled: false                # physics env progression is implicit via reward shaping
+
+logging:
+  log_interval: 10
+  eval_interval: 50
+  eval_episodes: 3
+  checkpoint_interval: 100
+  checkpoint_dir: "checkpoints"
+  use_wandb: false
+  wandb_project: "drone-swarm-mujoco"
+  wandb_entity: null
+
+# ============================================================
+# Phase 3 — Bid Policy Training (unchanged from config.yaml)
+# ============================================================
+bid_policy:
+  hidden: [64, 64]
+  lr: 3.0e-4
+  lr_value: 1.0e-3
+  log_std_init: -1.0
+  clip_eps: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  n_epochs: 4
+  mini_batch_size: 256
+  gamma: 0.99
+  gae_lambda: 0.95
+  n_updates: 200
+  episodes_per_update: 8
+  eval_interval: 20
+  checkpoint_interval: 50
