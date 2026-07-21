@@ -22,10 +22,11 @@
 
 env:
   n_drones: 3
-  max_steps: 600
-  spawn_z: 1.0                 # spawn at task height, not floor
-  obs_noise_std: 0.0           # no extra noise — physics provides variability
+  max_steps: 800               # longer episodes: time for 2-3 sequential tasks
+  spawn_z: 1.0
+  obs_noise_std: 0.0
   coop_time_threshold: 0.7
+  # room_size and spawn randomisation are now built into MujocoHomeEnv.reset()
 
 model:
   obs_dim: 15
@@ -41,10 +42,10 @@ training:
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
-  entropy_coef: 0.002          # slight increase: entropy collapsed to 4.7 (too little exploration)
+  entropy_coef: 0.01           # raised: entropy collapsed to 3.5, need more exploration
   value_coef: 0.5
   max_grad_norm: 0.5
-  lr_actor: 5.0e-5             # halved: +14 rollout was blowing up the policy each time
+  lr_actor: 1.0e-4             # moderate: fine-tune navigation to generalise across tasks
   lr_critic: 3.0e-4
   normalise_rewards: false
   device: "auto"

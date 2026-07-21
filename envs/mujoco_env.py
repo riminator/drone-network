@@ -385,16 +385,31 @@ class MujocoHomeEnv(MultiAgentEnv):
         # Reset MuJoCo state
         mujoco.mj_resetData(self._model, self._data)
 
-        # Spawn drones at staggered positions.
-        # spawn_z: start at task height (1.0m) not floor (0.3m) so the policy
-        # learns horizontal navigation first rather than wasting the whole
-        # episode learning to climb.  Configurable for curriculum.
-        spawn_z = float(self._cfg.get("spawn_z", 1.0))
+        # Spawn drones at randomised positions so the greedy allocator produces
+        # varied task-drone pairings across episodes.  Without randomisation,
+        # the same drone always gets the same nearest task and the policy
+        # memorises one (drone, task) pair instead of generalising navigation.
+        spawn_z   = float(self._cfg.get("spawn_z", 1.0))
+        room_size = float(self._cfg.get("room_size", 9.5))   # stay 0.5m from walls
+        rng = np.random.default_rng(seed)   # seed=None → fresh RNG each episode
+        # Sample positions with minimum 1.5m separation
+        positions: list[np.ndarray] = []
+        attempts = 0
+        while len(positions) < self._n_drones and attempts < 200:
+            attempts += 1
+            xy = rng.uniform(0.5, room_size, size=2)
+            if all(np.linalg.norm(xy - p[:2]) > 1.5 for p in positions):
+                positions.append(np.array([xy[0], xy[1], spawn_z]))
+        # Fall back to fixed stagger if sampling failed (very unlikely)
+        if len(positions) < self._n_drones:
+            positions = [np.array([1.0 + i * 1.2, 1.0, spawn_z])
+                         for i in range(self._n_drones)]
+
         for i in range(self._n_drones):
             adr = self._drone_qpos_adr[i]
-            self._data.qpos[adr + 0] = 1.0 + i * 1.2   # x
-            self._data.qpos[adr + 1] = 1.0              # y
-            self._data.qpos[adr + 2] = spawn_z          # z
+            self._data.qpos[adr + 0] = positions[i][0]
+            self._data.qpos[adr + 1] = positions[i][1]
+            self._data.qpos[adr + 2] = positions[i][2]
             # quaternion (w, x, y, z) — identity
             self._data.qpos[adr + 3] = 1.0
             self._data.qpos[adr + 4] = 0.0
@@ -411,9 +426,12 @@ class MujocoHomeEnv(MultiAgentEnv):
         self._last_bids  = []
         self._prev_dist  = {}   # clear proximity shaping cache
 
-        # Build tasks
+        # Build tasks — shuffle layout order so greedy allocator assigns
+        # different task indices to different drones each episode.
+        shuffled = list(self._task_layouts)
+        rng.shuffle(shuffled)
         self._tasks = []
-        for j, layout in enumerate(self._task_layouts):
+        for j, layout in enumerate(shuffled):
             ttype, tpos, tsteps = layout[0], layout[1], layout[2]
             shareable = layout[3] if len(layout) > 3 else False
             self._tasks.append(_make_task(ttype, j, tpos, tsteps, shareable))
