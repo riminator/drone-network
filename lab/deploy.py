@@ -192,12 +192,22 @@ def run_episode(
             if remaining > 0:
                 time.sleep(remaining)
 
-    info = next(iter(infos.values())) if infos else {}
+    # MujocoHomeEnv returns a single flat info dict; PybulletHomeEnv returns
+    # per-agent dicts.  Normalise both to a single flat dict before reading.
+    if infos and isinstance(next(iter(infos.values())), dict):
+        # PybulletHomeEnv style: {agent_id: {...}, ...} → pick any agent
+        flat_info = next(iter(infos.values()))
+    else:
+        # MujocoHomeEnv style: already a flat dict keyed by field name
+        flat_info = infos
+
     return {
         "total_reward": total_reward,
         "steps": steps,
-        "tasks_completed": info.get("tasks_completed", 0),
-        "tasks_total": info.get("tasks_total", 0),
+        # MujocoHomeEnv uses "tasks_done"; PybulletHomeEnv uses "tasks_completed"
+        "tasks_completed": flat_info.get("tasks_completed",
+                           flat_info.get("tasks_done", 0)),
+        "tasks_total": flat_info.get("tasks_total", 0),
     }
 
 
