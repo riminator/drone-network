@@ -52,3 +52,24 @@ logging:
   use_wandb: false           # set true to enable Weights & Biases
   wandb_project: "drone-swarm"
   wandb_entity: null
+
+# ============================================================
+# Phase 3 — Bid Policy Training
+# ============================================================
+bid_policy:
+  hidden: [64, 64]            # BidPolicy and BidValueNet hidden sizes
+  lr: 3.0e-4                  # learning rate for bid policy
+  lr_value: 1.0e-3            # learning rate for bid value net
+  log_std_init: -1.0          # initial log_std for bid Gaussian (std ≈ 0.37)
+  clip_eps: 0.2               # PPO clip epsilon
+  entropy_coef: 0.01          # entropy bonus coefficient
+  value_coef: 0.5             # value loss weight
+  max_grad_norm: 0.5
+  n_epochs: 4                 # PPO epochs per update
+  mini_batch_size: 256
+  gamma: 0.99
+  gae_lambda: 0.95
+  n_updates: 200              # total PPO updates (each = episodes_per_update episodes)
+  episodes_per_update: 8      # HomeEnv episodes collected per PPO update
+  eval_interval: 20           # evaluate every N updates
+  checkpoint_interval: 50     # save checkpoint every N updates
