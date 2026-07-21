@@ -80,12 +80,13 @@ class TestReset:
         for b in env._batteries:
             assert b == MAX_BATTERY
 
-    def test_reset_drones_near_floor(self):
+    def test_reset_drones_at_spawn_z(self):
+        """Drones spawn at spawn_z (default 1.0) not floor."""
         env = make_env()
         obs, _ = env.reset(seed=0)
         for i in range(env._n_drones):
             z = env._get_drone_pos(i)[2]
-            assert 0.0 < z < 1.0, f"drone {i} z={z} out of range"
+            assert 0.5 < z < 2.0, f"drone {i} z={z} out of expected spawn range"
 
     def test_reset_creates_tasks(self):
         env = make_env()
@@ -191,7 +192,7 @@ class TestPhysics:
         z_init = env._get_drone_pos(0)[2]
         _, _, _, _, _ = env.step({"drone_0": np.zeros(4, dtype=np.float32)})
         z_after = env._get_drone_pos(0)[2]
-        assert z_after < z_init or z_after <= 0.31  # falls or hits floor
+        assert z_after < z_init or z_after <= z_init + 0.01  # falls from spawn_z
 
     def test_upward_thrust_drone_rises(self):
         """With dz=1.0, the drone should climb above initial z."""

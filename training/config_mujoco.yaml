@@ -6,20 +6,25 @@
 #       --config training/config_mujoco.yaml --sim mujoco
 #
 # Key differences from config.yaml (HomeEnv):
-#   - 3 drones (scene XML has 3 bodies; avoids XML rebuild)
+#   - 3 drones (scene XML has 3 bodies)
 #   - max_steps=600: physics takes real time to traverse 10m
-#   - obs_noise_std=0.05: MuJoCo sensors already have physics
-#     variability; heavy extra noise hurts z-climb learning
-#   - rollout_steps=2048: shorter rollouts surface early signals
-#   - total_timesteps=3_000_000: MuJoCo @ ~2000 steps/sec on
-#     CPU → ~25 min; CUDA would be ~5 min
-#   - curriculum disabled: physics env is already hard enough
+#   - spawn_z=1.0: spawn at task height so policy learns
+#     horizontal navigation first, not just z-climbing
+#   - obs_noise_std=0.0: remove noise — MuJoCo physics already
+#     provides natural variability; noise + physics = too hard
+#   - rollout_steps=4096: longer rollouts give better value
+#     estimates when task completions are sparse
+#   - entropy_coef=0.003: prevent log_std from growing unchecked
+#     (observed entropy >6.5 = pure noise at 260 updates)
+#   - total_timesteps=5_000_000: physics at 2000 steps/sec →
+#     ~40 min on CPU; check task completion at update 100
 # ============================================================
 
 env:
   n_drones: 3
   max_steps: 600
-  obs_noise_std: 0.05          # light sensor noise (physics already noisy)
+  spawn_z: 1.0                 # spawn at task height, not floor
+  obs_noise_std: 0.0           # no extra noise — physics provides variability
   coop_time_threshold: 0.7
 
 model:
@@ -29,23 +34,23 @@ model:
   critic_hidden: [512, 256]
 
 training:
-  total_timesteps: 3_000_000
-  rollout_steps: 2048           # shorter rollouts → faster signal from task completions
+  total_timesteps: 5_000_000
+  rollout_steps: 4096          # longer rollouts → better GAE value estimates
   mini_batch_size: 256
   n_epochs: 5
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
-  entropy_coef: 0.01            # slightly higher entropy: encourages altitude exploration
+  entropy_coef: 0.003          # low: prevents log_std explosion (was 0.01, saw entropy >7)
   value_coef: 0.5
   max_grad_norm: 0.5
-  lr_actor: 3.0e-4              # standard rate: MuJoCo policy starts from scratch
-  lr_critic: 1.0e-3
+  lr_actor: 1.0e-4             # conservative: prevents overshooting with dense shaping
+  lr_critic: 5.0e-4
   normalise_rewards: true
   device: "auto"
 
 curriculum:
-  enabled: false                # physics env progression is implicit via reward shaping
+  enabled: false               # reward shaping handles curriculum implicitly
 
 logging:
   log_interval: 10

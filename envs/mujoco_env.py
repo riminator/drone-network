@@ -67,12 +67,18 @@ _ASSETS_DIR = Path(__file__).parent.parent / "assets" / "mujoco"
 _SCENE_XML   = str(_ASSETS_DIR / "scene.xml")
 
 # ---------------------------------------------------------------------------
-# Reward constants — mirror HomeEnv exactly
+# Reward constants — tuned for MuJoCo physics training
 # ---------------------------------------------------------------------------
-REWARD_STEP_ALIVE   = -0.01
-REWARD_COLLISION    = -5.0
-REWARD_BATTERY_DEAD = -3.0
-REWARD_COOP_BONUS   = 2.0
+# HomeEnv uses small per-step penalties because episodes are short (max 500
+# teleport-steps).  MuJoCo episodes are 600 real-physics steps, so we scale
+# the alive penalty down and add dense proximity shaping so the policy gets
+# useful gradient every step even before it ever completes a task.
+REWARD_STEP_ALIVE    = -0.002   # was -0.01; 600 steps × 3 drones = -3.6 total
+REWARD_COLLISION     = -0.5     # was -5.0; early training noise was drowning signal
+REWARD_BATTERY_DEAD  = -1.0     # was -3.0; softer — battery dying is already a problem
+REWARD_COOP_BONUS    = 2.0
+REWARD_PROXIMITY_SCALE = 0.5    # dense shaping: reward per metre of progress toward task
+REWARD_TASK_COMPLETE = 5.0      # sparse bonus per completed task (on top of engage steps)
 
 # ---------------------------------------------------------------------------
 # Quadrotor physics constants
@@ -117,8 +123,10 @@ _CTRL_DT      = 0.04   # s  (timestep × phys_steps = 0.002 × 20)
 # Battery drain: full charge lasts ~MAX_BATTERY env steps
 _BATTERY_DRAIN_PER_STEP = MAX_BATTERY / 500
 
-# Task engage distance: drone must be within this many metres
-_ENGAGE_DIST = 0.40  # m
+# Task engage distance: drone must be within this many metres.
+# Increased from 0.40 → 1.2 m because MuJoCo drones have real inertia and
+# overshoot the tight 0.4m window before the policy learns to brake.
+_ENGAGE_DIST = 1.2   # m
 
 # Collision distance (centre-to-centre)
 _COLLISION_DIST = 0.18  # m
@@ -286,6 +294,7 @@ class MujocoHomeEnv(MultiAgentEnv):
             )
         super().__init__()
         cfg = config or {}
+        self._cfg = cfg   # kept for runtime config queries (e.g. spawn_z)
 
         self._n_drones    = min(int(cfg.get("n_drones", 3)), self.MAX_DRONES)
         self._max_steps   = int(cfg.get("max_steps", 500))
@@ -356,6 +365,8 @@ class MujocoHomeEnv(MultiAgentEnv):
         self._drone_task_map: dict[str, int | None] = {}
         self._step_count = 0
         self._last_bids: list[Bid] = []
+        # Dense proximity shaping: tracks previous distance per (agent, task) pair
+        self._prev_dist: dict[tuple[str, int], float] = {}
 
         # Viewer handle
         self._viewer = None
@@ -371,13 +382,16 @@ class MujocoHomeEnv(MultiAgentEnv):
         # Reset MuJoCo state
         mujoco.mj_resetData(self._model, self._data)
 
-        # Spawn drones at staggered positions
+        # Spawn drones at staggered positions.
+        # spawn_z: start at task height (1.0m) not floor (0.3m) so the policy
+        # learns horizontal navigation first rather than wasting the whole
+        # episode learning to climb.  Configurable for curriculum.
+        spawn_z = float(self._cfg.get("spawn_z", 1.0))
         for i in range(self._n_drones):
             adr = self._drone_qpos_adr[i]
-            # position
             self._data.qpos[adr + 0] = 1.0 + i * 1.2   # x
             self._data.qpos[adr + 1] = 1.0              # y
-            self._data.qpos[adr + 2] = 0.3              # z (just off floor)
+            self._data.qpos[adr + 2] = spawn_z          # z
             # quaternion (w, x, y, z) — identity
             self._data.qpos[adr + 3] = 1.0
             self._data.qpos[adr + 4] = 0.0
@@ -387,11 +401,12 @@ class MujocoHomeEnv(MultiAgentEnv):
         mujoco.mj_forward(self._model, self._data)
 
         # Reset per-drone Python state
-        self._batteries = [MAX_BATTERY] * self._n_drones
-        self._pids      = [_DronePID() for _ in range(self._n_drones)]
+        self._batteries  = [MAX_BATTERY] * self._n_drones
+        self._pids       = [_DronePID() for _ in range(self._n_drones)]
         self._target_pos = [self._get_drone_pos(i).copy() for i in range(self._n_drones)]
         self._step_count = 0
         self._last_bids  = []
+        self._prev_dist  = {}   # clear proximity shaping cache
 
         # Build tasks
         self._tasks = []
@@ -454,7 +469,7 @@ class MujocoHomeEnv(MultiAgentEnv):
             if self._batteries[i] <= 0:
                 rewards[aid] += REWARD_BATTERY_DEAD
 
-        # --- Task progress -------------------------------------------
+        # --- Task progress + dense proximity shaping -----------------
         tasks_done_before = sum(1 for t in self._tasks if t.completed)
         for i, aid in enumerate(sorted(self._agent_ids)):
             task_idx = self._drone_task_map.get(aid)
@@ -463,14 +478,23 @@ class MujocoHomeEnv(MultiAgentEnv):
             task = self._tasks[task_idx]
             if task.completed or task.status == TaskStatus.VANISHED:
                 continue
-            pos = self._get_drone_pos(i)
-            dist = np.linalg.norm(pos - task.spec.target_position)
+            pos  = self._get_drone_pos(i)
+            dist = float(np.linalg.norm(pos - task.spec.target_position))
+
+            # Dense shaping: reward for getting closer to the task target.
+            # prev_dist stored per (agent, task) in self._prev_dist.
+            key = (aid, task_idx)
+            prev_dist = self._prev_dist.get(key, dist)
+            delta = prev_dist - dist          # positive = got closer
+            rewards[aid] += REWARD_PROXIMITY_SCALE * delta
+            self._prev_dist[key] = dist
+
             act = actions.get(aid, np.zeros(self.ACT_DIM))
             tool_engaged = float(act[3]) > 0.5
             if dist < _ENGAGE_DIST:
                 task.step(drone_position=pos, tool_engaged=tool_engaged)
                 if task.completed:
-                    rewards[aid] += task.spec.engage_steps_required * 0.2
+                    rewards[aid] += REWARD_TASK_COMPLETE
 
         tasks_done_after = sum(1 for t in self._tasks if t.completed)
         if tasks_done_after > tasks_done_before:
@@ -776,9 +800,13 @@ class MujocoHomeEnv(MultiAgentEnv):
         result = self.allocator.allocate(snapshot)
         self._last_bids = result.bids
 
-        # Apply assignments
+        # Apply assignments — clear stale proximity cache on reassignment
         for aid, task_idx in result.assignments.items():
             if aid in self._drone_task_map:
+                old_idx = self._drone_task_map[aid]
+                if old_idx != task_idx:
+                    # Remove old entry so shaping restarts from current distance
+                    self._prev_dist.pop((aid, old_idx), None)
                 self._drone_task_map[aid] = task_idx
 
         # Handle co-assignments (shareable tasks may receive extra drones)
