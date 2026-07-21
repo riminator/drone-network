@@ -205,6 +205,47 @@ def _make_task(task_type: str, idx: int, target: list, engage_steps: int,
 
 
 # ---------------------------------------------------------------------------
+# Viewer helper
+# ---------------------------------------------------------------------------
+
+class _NoOpViewer:
+    """Stub returned when the real viewer cannot be opened (e.g. no display)."""
+    def sync(self):  pass
+    def close(self): pass
+    def __bool__(self): return False
+
+
+def _open_viewer(model, data):
+    """
+    Open a MuJoCo passive viewer, handling the macOS `mjpython` requirement.
+
+    On macOS, `mujoco.viewer.launch_passive` raises RuntimeError unless the
+    script is run under `mjpython`.  When that happens we:
+      1. Print the exact command the user should run to get the GUI.
+      2. Return a no-op stub so the simulation still runs headless.
+
+    On Linux/Windows `launch_passive` works from any Python process.
+    """
+    import sys
+    try:
+        import mujoco.viewer as mj_viewer
+        handle = mj_viewer.launch_passive(model, data)
+        return handle
+    except RuntimeError as exc:
+        if "mjpython" in str(exc):
+            import sys as _sys
+            script = " ".join(_sys.argv)
+            print(
+                "\n[MuJoCo viewer] On macOS the passive viewer requires mjpython.\n"
+                "  Run your command like this to get the GUI:\n\n"
+                f"    mjpython {script}\n\n"
+                "  Continuing headless (render=True has no effect until mjpython is used).\n"
+            )
+            return _NoOpViewer()
+        raise   # re-raise any other RuntimeError
+
+
+# ---------------------------------------------------------------------------
 # Main environment
 # ---------------------------------------------------------------------------
 class MujocoHomeEnv(MultiAgentEnv):
@@ -365,8 +406,7 @@ class MujocoHomeEnv(MultiAgentEnv):
 
         # Open viewer if requested
         if self._render and self._viewer is None:
-            import mujoco.viewer as mj_viewer  # lazy — only needed for GUI rendering
-            self._viewer = mj_viewer.launch_passive(self._model, self._data)
+            self._viewer = _open_viewer(self._model, self._data)
 
         obs = self._build_obs()
         return obs, {}
@@ -457,7 +497,7 @@ class MujocoHomeEnv(MultiAgentEnv):
 
         # --- Viewer sync ---------------------------------------------
         if self._render and self._viewer is not None:
-            self._viewer.sync()
+            self._viewer.sync()   # no-op if _NoOpViewer
 
         obs  = self._build_obs()
         info = {
