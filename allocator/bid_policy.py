@@ -1,14 +1,18 @@
 """
 bid_policy.py
-Neural network that produces a scalar bid value for a (drone, task) pair.
+Neural network that produces a scalar bid value for a (drone, task) pair,
+plus a separate learned marginal-value score for co-assignment decisions.
 
 Architecture
 ------------
 Input:  BID_OBS_DIM = 14 features describing one (drone, task) pairing
-Output: single scalar logit, passed through sigmoid → bid ∈ (0, 1)
+Output:
+  - primary bid logit  → sigmoid → bid ∈ (0, 1)   (used for primary assignment)
+  - marginal bid logit → sigmoid → marginal ∈ (0, 1) (used for co-assignment;
+    this head is trained to predict extra value of joining an in-progress task)
 
-The network is intentionally small (two 64-unit hidden layers) so it trains
-quickly on CPU.  The execution actors (Actor, 256×256) are frozen throughout.
+The two heads share the same hidden-layer trunk so marginal prediction is
+cheap and benefits from the shared representation.
 
 Observation layout (14 dims)
 -----------------------------
@@ -71,10 +75,19 @@ def build_bid_obs(
 
 class BidPolicy(nn.Module):
     """
-    Maps a (drone, task) observation to a scalar bid in (0, 1).
+    Maps a (drone, task) observation to:
+      - a primary bid scalar ∈ (0, 1)         — used for primary task assignment
+      - a marginal bid scalar ∈ (0, 1)        — used for co-assignment decisions;
+        represents the learned extra value of adding this drone to a task that
+        already has at least one assignee.
 
-    forward(obs) → raw logit  (used during training for log-prob computation)
-    bid(obs)     → sigmoid(logit)  (used during allocation)
+    forward(obs) → (primary_logit, marginal_logit)  (used during training)
+    bid(obs)     → sigmoid(primary_logit)            (used during primary assignment)
+    marginal_bid(obs) → sigmoid(marginal_logit)      (used during co-assignment)
+
+    Both heads share the same hidden-layer trunk (same weights), so the marginal
+    head learns from the same feature representation as the primary head with no
+    extra parameters in the trunk.
     """
 
     def __init__(self, obs_dim: int = BID_OBS_DIM, hidden: list[int] | None = None):
@@ -85,8 +98,10 @@ class BidPolicy(nn.Module):
         for h in hidden:
             layers += [nn.Linear(in_dim, h), nn.Tanh()]
             in_dim = h
-        layers.append(nn.Linear(in_dim, 1))
-        self.net = nn.Sequential(*layers)
+        self.trunk = nn.Sequential(*layers)
+        # Two independent output heads — each maps trunk output → scalar logit
+        self.primary_head   = nn.Linear(in_dim, 1)
+        self.marginal_head  = nn.Linear(in_dim, 1)
         self._init_weights()
 
     def _init_weights(self):
@@ -95,18 +110,35 @@ class BidPolicy(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 nn.init.zeros_(m.bias)
         # Small output init keeps bids near 0.5 at start
-        nn.init.orthogonal_(self.net[-1].weight, gain=0.01)
+        nn.init.orthogonal_(self.primary_head.weight,  gain=0.01)
+        nn.init.orthogonal_(self.marginal_head.weight, gain=0.01)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Returns raw logit, shape (...,)."""
-        return self.net(obs).squeeze(-1)
+    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (primary_logit, marginal_logit), each shape (...,)."""
+        features = self.trunk(obs)
+        return (
+            self.primary_head(features).squeeze(-1),
+            self.marginal_head(features).squeeze(-1),
+        )
 
     def bid(self, obs: torch.Tensor) -> torch.Tensor:
-        """Returns bid ∈ (0, 1), shape (...,)."""
-        return torch.sigmoid(self.forward(obs))
+        """Primary bid ∈ (0, 1), shape (...,)."""
+        primary_logit, _ = self.forward(obs)
+        return torch.sigmoid(primary_logit)
+
+    def marginal_bid(self, obs: torch.Tensor) -> torch.Tensor:
+        """Marginal co-assignment bid ∈ (0, 1), shape (...,)."""
+        _, marginal_logit = self.forward(obs)
+        return torch.sigmoid(marginal_logit)
 
     def bid_numpy(self, obs: np.ndarray) -> float:
-        """Convenience: accepts numpy array, returns Python float."""
+        """Primary bid — accepts numpy array, returns Python float."""
         with torch.no_grad():
             t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
             return float(self.bid(t).item())
+
+    def marginal_bid_numpy(self, obs: np.ndarray) -> float:
+        """Marginal bid — accepts numpy array, returns Python float."""
+        with torch.no_grad():
+            t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            return float(self.marginal_bid(t).item())

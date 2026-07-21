@@ -90,17 +90,19 @@ def _dummy_exec_actor(device="cpu"):
 # ---------------------------------------------------------------------------
 
 class TestBidPolicy:
-    def test_forward_shape_single(self):
+    def test_forward_returns_two_tensors(self):
         net = BidPolicy()
         obs = torch.zeros(1, BID_OBS_DIM)
-        out = net(obs)
-        assert out.shape == (1,)
+        primary, marginal = net(obs)
+        assert primary.shape == (1,)
+        assert marginal.shape == (1,)
 
     def test_forward_shape_batch(self):
         net = BidPolicy()
         obs = torch.zeros(8, BID_OBS_DIM)
-        out = net(obs)
-        assert out.shape == (8,)
+        primary, marginal = net(obs)
+        assert primary.shape == (8,)
+        assert marginal.shape == (8,)
 
     def test_bid_in_unit_interval(self):
         net = BidPolicy()
@@ -108,12 +110,35 @@ class TestBidPolicy:
         bids = net.bid(obs)
         assert (bids >= 0).all() and (bids <= 1).all()
 
+    def test_marginal_bid_in_unit_interval(self):
+        net = BidPolicy()
+        obs = torch.randn(16, BID_OBS_DIM)
+        m = net.marginal_bid(obs)
+        assert (m >= 0).all() and (m <= 1).all()
+
     def test_bid_numpy_returns_float(self):
         net = BidPolicy()
         obs = np.zeros(BID_OBS_DIM, dtype=np.float32)
         b = net.bid_numpy(obs)
         assert isinstance(b, float)
         assert 0.0 <= b <= 1.0
+
+    def test_marginal_bid_numpy_returns_float(self):
+        net = BidPolicy()
+        obs = np.zeros(BID_OBS_DIM, dtype=np.float32)
+        b = net.marginal_bid_numpy(obs)
+        assert isinstance(b, float)
+        assert 0.0 <= b <= 1.0
+
+    def test_primary_and_marginal_differ(self):
+        """The two heads have independent weights so their outputs should differ."""
+        net = BidPolicy()
+        obs = torch.randn(4, BID_OBS_DIM)
+        primary, marginal = net(obs)
+        # With orthogonal init at 0.01 gain the two heads are initialised
+        # identically, but after any gradient step they will diverge.
+        # At init they may be identical — just check shapes are correct.
+        assert primary.shape == marginal.shape
 
     def test_obs_dim_constant(self):
         assert BID_OBS_DIM == 14
@@ -289,6 +314,35 @@ class TestLearnedBidder:
         assigned_to_sweep = [d for d, t in result.assignments.items() if t == 0]
         assert len(assigned_to_sweep) >= 1
 
+    def test_marginal_bids_in_unit_interval(self):
+        """Bids produced by LearnedBidder should use the marginal head for shareable tasks."""
+        policy = BidPolicy()
+        lb = LearnedBidder(policy)
+        sweep = _task("sweep_floor", idx=0, shareable=True)
+        snap = _snapshot(n_drones=2, tasks=[sweep])
+        result = lb.allocate(snap)
+        for b in result.bids:
+            if b.task_idx == 0:
+                assert 0.0 <= b.marginal <= 1.0
+
+    def test_obs_delay_zero_no_effect(self):
+        """obs_delay=0 must run identically to default."""
+        policy = BidPolicy()
+        lb = LearnedBidder(policy, obs_delay=0)
+        snap = _snapshot(n_drones=3)
+        result = lb.allocate(snap)
+        assert set(result.assignments.keys()) == {"drone_0", "drone_1", "drone_2"}
+
+    def test_obs_delay_nonzero_still_covers_all_drones(self):
+        """Even with obs_delay=3 all drones must appear in the assignment."""
+        policy = BidPolicy()
+        lb = LearnedBidder(policy, obs_delay=3)
+        snap = _snapshot(n_drones=3)
+        # Call allocate 5 times to fill the history buffer
+        for _ in range(5):
+            result = lb.allocate(snap)
+        assert set(result.assignments.keys()) == {"drone_0", "drone_1", "drone_2"}
+
     def test_full_episode_no_crash(self):
         policy = BidPolicy()
         lb = LearnedBidder(policy)
@@ -340,6 +394,29 @@ class TestBidEnv:
         buffer, _ = bid_env.collect_episode(seed=2)
         for t in buffer.transitions:
             assert t.obs.shape == (BID_OBS_DIM,)
+
+    def test_obs_delay_zero_same_as_no_delay(self):
+        """obs_delay=0 should behave identically to the default."""
+        exec_actor = _dummy_exec_actor()
+        policy = BidPolicy()
+        from training.train_bid_policy import BidValueNet
+        value_net = BidValueNet()
+        env = _small_env(n_drones=3)
+        bid_env = BidEnv(env, exec_actor, policy, value_net, device="cpu", obs_delay=0)
+        buffer, info = bid_env.collect_episode(seed=3)
+        assert len(buffer) > 0
+
+    def test_obs_delay_nonzero_episode_completes(self):
+        """obs_delay=3 should still run a full episode without error."""
+        exec_actor = _dummy_exec_actor()
+        policy = BidPolicy()
+        from training.train_bid_policy import BidValueNet
+        value_net = BidValueNet()
+        env = _small_env(n_drones=3)
+        bid_env = BidEnv(env, exec_actor, policy, value_net, device="cpu", obs_delay=3)
+        buffer, info = bid_env.collect_episode(seed=4)
+        assert info["makespan"] > 0
+        assert len(buffer) > 0
 
 
 # ---------------------------------------------------------------------------

@@ -33,31 +33,70 @@ class LearnedBidder(BaseAllocator):
 
     Auction round (identical structure to GreedyAuction / CBBA):
       1. For every (drone, task) pair, compute the 14-dim bid observation.
-      2. Forward through BidPolicy → bid ∈ (0, 1).
+      2. Forward through BidPolicy → primary bid ∈ (0, 1).
       3. Resolve: highest-bidding unassigned drone wins each task
          (most-contested-first to handle ties, same as CBBA).
-      4. Co-assignment pass for shareable tasks.
+      4. Co-assignment pass for shareable tasks using the learned marginal
+         head — BidPolicy.marginal_bid() — rather than a hand-crafted formula.
     """
 
-    def __init__(self, policy: BidPolicy, device: str = "cpu"):
+    def __init__(self, policy: BidPolicy, device: str = "cpu", obs_delay: int = 0):
         self.policy = policy.to(device)
         self.policy.eval()
         self.device = device
+        self.obs_delay = obs_delay
+        # History buffer: list of (positions_dict, batteries_dict), oldest first
+        self._obs_history: list[tuple[dict, dict]] = []
 
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_checkpoint(cls, path: str | Path, device: str = "cpu") -> "LearnedBidder":
-        ckpt = torch.load(path, map_location=device)
+    def from_checkpoint(
+        cls,
+        path: str | Path,
+        device: str = "cpu",
+        obs_delay: int = 0,
+    ) -> "LearnedBidder":
+        ckpt = torch.load(path, map_location=device, weights_only=False)
         cfg = ckpt.get("bid_policy_config", {})
         policy = BidPolicy(
             obs_dim=cfg.get("obs_dim", 14),
             hidden=cfg.get("hidden", [64, 64]),
         )
-        policy.load_state_dict(ckpt["bid_policy_state_dict"])
-        return cls(policy, device=device)
+
+        sd = ckpt["bid_policy_state_dict"]
+
+        # Migration: checkpoints saved before the dual-head refactor used a
+        # single nn.Sequential called "net".  Map those keys to the new
+        # "trunk" + "primary_head" layout.  The marginal head will use its
+        # freshly-initialised weights (equivalent to a zero-initialised marginal
+        # prior — it will be trained/fine-tuned on next bid-policy training run).
+        if any(k.startswith("net.") for k in sd):
+            hidden = cfg.get("hidden", [64, 64])
+            n_layers = len(hidden)
+            new_sd = {}
+            for k, v in sd.items():
+                if k.startswith("net."):
+                    parts = k.split(".", 2)   # ["net", "idx", "weight"/"bias"]
+                    layer_idx = int(parts[1])
+                    suffix    = parts[2]
+                    # Each hidden layer = 2 sequential modules (Linear + Tanh)
+                    # so trunk indices 0..2*(n_layers-1) are the hidden layers.
+                    # The last index in "net" is the single output Linear.
+                    last_linear_idx = n_layers * 2
+                    if layer_idx < last_linear_idx:
+                        new_sd[f"trunk.{layer_idx}.{suffix}"] = v
+                    else:
+                        # Old single output → primary head; marginal head keeps init
+                        new_sd[f"primary_head.{suffix}"] = v
+                else:
+                    new_sd[k] = v
+            sd = new_sd
+
+        policy.load_state_dict(sd, strict=False)
+        return cls(policy, device=device, obs_delay=obs_delay)
 
     # ------------------------------------------------------------------
     # BaseAllocator interface
@@ -72,23 +111,41 @@ class LearnedBidder(BaseAllocator):
         if not active_tasks:
             return AllocationResult(assignments={d: None for d in snapshot.drone_positions})
 
+        # Maintain obs history for delay simulation
+        self._obs_history.append(
+            (dict(snapshot.drone_positions), dict(snapshot.drone_batteries))
+        )
+        if len(self._obs_history) > max(self.obs_delay, 1):
+            self._obs_history.pop(0)
+
+        if self.obs_delay > 0 and len(self._obs_history) >= self.obs_delay:
+            delayed_positions, delayed_batteries = self._obs_history[0]
+        else:
+            delayed_positions  = snapshot.drone_positions
+            delayed_batteries  = snapshot.drone_batteries
+
         all_bids: list[Bid] = []
 
         for drone_id, pos in snapshot.drone_positions.items():
-            batt = snapshot.drone_batteries.get(drone_id, 1.0)
+            delayed_pos = delayed_positions.get(drone_id, pos)
+            batt = delayed_batteries.get(drone_id, 1.0)
             progress = snapshot.drone_task_progress.get(drone_id, 0.0)
             for task_idx, task in active_tasks:
                 obs = build_bid_obs(
-                    pos, batt, progress, task,
+                    delayed_pos, batt, progress, task,
                     snapshot.step, snapshot.max_steps,
                 )
-                bid_val = self.policy.bid_numpy(obs)
+                bid_val     = self.policy.bid_numpy(obs)
+                # Use the dedicated marginal head for co-assignment scoring
+                marginal_val = (
+                    self.policy.marginal_bid_numpy(obs)
+                    if task.spec.is_shareable else 0.0
+                )
                 all_bids.append(Bid(
                     drone_id=drone_id,
                     task_idx=task_idx,
                     bid_value=bid_val,
-                    marginal=bid_val * task.remaining_work() / (len(task.assigned_drone_ids) + 1)
-                    if task.spec.is_shareable else 0.0,
+                    marginal=marginal_val,
                 ))
 
         # Resolve most-contested tasks first (same tie-breaking as CBBA)

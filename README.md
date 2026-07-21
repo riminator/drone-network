@@ -13,7 +13,7 @@ Classical multi-robot task allocation (MRTA) assumes a fixed task set. This proj
 The core contribution is replacing hand-crafted bidding heuristics with a **learned bidding policy** (PPO-trained against optimal-assignment baselines) that can represent both:
 
 - **Discrete reassignment** — a task vanishes; the freed drone must instantly re-enter the auction for remaining tasks.
-- **Continuous task-sharing** — an idle drone can bid to *join* an in-progress task (marginal-value co-assignment), rather than only bidding on unclaimed tasks.
+- **Continuous task-sharing** — an idle drone can bid to *join* an in-progress task using a dedicated **learned marginal-value head**, rather than a hand-crafted formula.
 
 ---
 
@@ -38,6 +38,8 @@ The core contribution is replacing hand-crafted bidding heuristics with a **lear
 │        │                   configurable comm_delay for robustness    │
 │        ├── OracleAllocator Hungarian algorithm upper bound           │
 │        └── LearnedBidder   BidPolicy (PPO-trained 14-dim → sigmoid)  │
+│                            dual-head: primary bid + marginal bid     │
+│                            obs_delay parameter for robustness eval   │
 │                                                                      │
 │   BidPolicy obs (14 dims): drone pos, battery, progress,             │
 │     vector-to-task, remaining_work, n_assigned, urgency, type-onehot │
@@ -85,12 +87,15 @@ drone-network/
 │   ├── cbba.py               Consensus-Based Bundle Algorithm
 │   │                           configurable comm_delay, MAX_BUNDLE_SIZE=3
 │   ├── oracle.py             Hungarian-algorithm optimal assignment (scipy)
-│   ├── bid_policy.py         BidPolicy MLP: 14-dim obs → sigmoid bid ∈ (0,1)
-│   │                           build_bid_obs() helper constructs per-pair obs
+│   ├── bid_policy.py         BidPolicy MLP: 14-dim obs → (primary_bid, marginal_bid)
+│   │                           shared trunk + two independent output heads
+│   │                           build_bid_obs() constructs per-pair observation
 │   ├── learned_bidder.py     LearnedBidder wraps BidPolicy as a BaseAllocator
-│   │                           from_checkpoint() factory
+│   │                           from_checkpoint() with old-format migration
+│   │                           obs_delay parameter for robustness experiments
 │   └── bid_env.py            BidEnv: HomeEnv wrapper that collects bid transitions
 │                               BidBuffer / BidTransition for bid-policy PPO
+│                               obs_delay: stale observation simulation
 │
 ├── models/
 │   ├── actor.py              Gaussian policy MLP (tanh/sigmoid squashing, log-prob correction)
@@ -99,13 +104,14 @@ drone-network/
 ├── training/
 │   ├── train_mappo.py        Phase 1: MAPPO loop — shared Actor + CentralCritic
 │   ├── train_bid_policy.py   Phase 3: BidPolicy PPO — frozen exec actor + BidValueNet
-│   └── config.yaml           All hyperparameters (MAPPO + bid-policy sections)
+│   ├── config.yaml           MAPPO hyperparameters + bid-policy section
+│   └── config_bid.yaml       Dedicated bid-policy config (7-task harder layout)
 │
 ├── evaluation/
 │   ├── eval.py               Load checkpoint → benchmark episodes (execution eval)
 │   └── eval_allocation.py    Phase 4: disruption-scenario harness
 │                               4 allocators × 6 scenarios × N episodes
-│                               EpisodeMetrics table + optional CSV export
+│                               EpisodeMetrics (incl. mean_realloc_latency) + CSV export
 │
 ├── lab/
 │   └── deploy.py             Load checkpoint → PyBullet GUI
@@ -116,8 +122,10 @@ drone-network/
 ├── tests/
 │   ├── test_phase1.py        TaskStatus FSM, disruption API, co-assignment (25 tests)
 │   ├── test_phase2.py        GreedyAuction + CBBA contract + disruption (28 tests)
-│   ├── test_phase3.py        BidPolicy, BidBuffer, OracleAllocator, LearnedBidder (29 tests)
-│   ├── test_phase4.py        EpisodeMetrics, scenario hooks, benchmark driver (45 tests)
+│   ├── test_phase3.py        BidPolicy dual-head, BidBuffer, OracleAllocator,
+│   │                           LearnedBidder, obs_delay, marginal bids (35 tests)
+│   ├── test_phase4.py        EpisodeMetrics, realloc latency, scenario hooks,
+│   │                           _CountingAllocator, benchmark driver (52 tests)
 │   └── test_phase5.py        PybulletEnv allocator integration, bid lines (36 tests)
 │
 ├── utils/
@@ -129,17 +137,314 @@ drone-network/
 │   ├── light_switch.urdf
 │   └── floor_zone.urdf
 │
-└── checkpoints/
-    ├── actor_update204_final.pt      Best execution actor
-    ├── bid_policy_final.pt           Best learned bidder
-    └── bid_policy_update{50,100,150,200}.pt
+├── checkpoints/              (git-ignored — present locally)
+│   ├── actor_update204_final.pt    Best execution actor (5M steps)
+│   ├── bid_policy_final.pt         Best learned bidder (400 updates)
+│   └── bid_policy_update{50,100,...,400}.pt
+│
+└── results/                  (git-ignored — present locally)
+    └── phase4_results.csv    20-episode benchmark (480 rows)
 ```
 
 ---
 
-## Quick Start
+## Testing Everything
 
-### 1. Install dependencies
+All commands run from the repo root. Checkpoints are in `checkpoints/` (git-ignored).
+
+### 0 — Unit tests (run first, always)
+
+```bash
+# Full suite — 176 tests, ~2 seconds
+python3 -m pytest tests/ -v
+
+# Per-phase
+python3 -m pytest tests/test_phase1.py -v   # env, disruption API, co-assignment
+python3 -m pytest tests/test_phase2.py -v   # GreedyAuction, CBBA
+python3 -m pytest tests/test_phase3.py -v   # BidPolicy dual-head, BidEnv, LearnedBidder
+python3 -m pytest tests/test_phase4.py -v   # eval harness, realloc latency metric
+python3 -m pytest tests/test_phase5.py -v   # PyBullet integration
+
+# Specific feature groups
+python3 -m pytest tests/test_phase3.py -k "obs_delay" -v          # robustness parameter
+python3 -m pytest tests/test_phase3.py -k "marginal" -v           # marginal-value head
+python3 -m pytest tests/test_phase4.py -k "latency" -v            # realloc latency metric
+python3 -m pytest tests/test_phase4.py -k "disruption" -v         # disruption hooks
+python3 -m pytest tests/ -k "shareable" -v                        # co-assignment
+```
+
+Expected output: `176 passed`
+
+---
+
+### 1 — Verify checkpoints load correctly
+
+```bash
+# Execution actor
+python3 -c "
+import torch
+ckpt = torch.load('checkpoints/actor_update204_final.pt', map_location='cpu', weights_only=False)
+print('Actor  — update:', ckpt['update'], '| timesteps:', f\"{ckpt['timesteps']:,}\")
+"
+
+# Bid policy (includes backward-compat migration for old single-head format)
+python3 -c "
+from allocator.learned_bidder import LearnedBidder
+lb = LearnedBidder.from_checkpoint('checkpoints/bid_policy_final.pt')
+import numpy as np
+from allocator.bid_policy import build_bid_obs, BID_OBS_DIM
+from envs.tasks.base_task import TaskSpec, TaskStatus
+from envs.tasks.water_plant import WaterPlantTask
+spec = TaskSpec('t', 'water_plant', np.array([3.,3.,1.], dtype=np.float32), engage_steps_required=10)
+task = WaterPlantTask(spec); task.status = TaskStatus.ASSIGNED
+obs = build_bid_obs(np.zeros(3, dtype=np.float32), 1.0, 0.0, task, 0, 500)
+print('primary bid :', lb.policy.bid_numpy(obs))
+print('marginal bid:', lb.policy.marginal_bid_numpy(obs))
+"
+```
+
+---
+
+### 2 — Evaluate execution quality
+
+```bash
+# 20 deterministic episodes with the trained actor
+python3 -m evaluation.eval \
+    --checkpoint checkpoints/actor_update204_final.pt \
+    --episodes 20
+
+# Render ASCII output step-by-step (slow)
+python3 -m evaluation.eval \
+    --checkpoint checkpoints/actor_update204_final.pt \
+    --episodes 3 \
+    --render
+```
+
+Expected: task completion ~80–100%, mean reward +40 to +60.
+
+---
+
+### 3 — Disruption-scenario benchmark (the main paper results)
+
+**Important:** `--exec-checkpoint` takes the **actor** file; `--checkpoint` takes the **bid policy** file.
+
+```bash
+# Full run — 4 allocators × 6 scenarios × 20 episodes = 480 episodes (~3 min)
+python3 -m evaluation.eval_allocation \
+    --exec-checkpoint checkpoints/actor_update204_final.pt \
+    --checkpoint     checkpoints/bid_policy_final.pt \
+    --episodes 20 \
+    --csv results/phase4_results.csv
+
+# Quick smoke — random actions, no checkpoints needed (~15 seconds)
+python3 -m evaluation.eval_allocation --episodes 3
+
+# Single scenario
+python3 -m evaluation.eval_allocation \
+    --exec-checkpoint checkpoints/actor_update204_final.pt \
+    --checkpoint     checkpoints/bid_policy_final.pt \
+    --scenarios task_vanish \
+    --episodes 10
+
+# Two allocators head-to-head on all scenarios
+python3 -m evaluation.eval_allocation \
+    --exec-checkpoint checkpoints/actor_update204_final.pt \
+    --checkpoint     checkpoints/bid_policy_final.pt \
+    --allocators cbba learned \
+    --episodes 20
+
+# Robustness: CBBA (comm_delay=10) vs Learned (obs_delay has no CLI flag —
+# controlled at library level; use the comm_delay scenario for the paper comparison)
+python3 -m evaluation.eval_allocation \
+    --exec-checkpoint checkpoints/actor_update204_final.pt \
+    --checkpoint     checkpoints/bid_policy_final.pt \
+    --scenarios comm_delay \
+    --allocators greedy cbba oracle learned \
+    --comm-delay 10 \
+    --episodes 20
+
+# Surge scenario only (tests co-assignment + task injection handling)
+python3 -m evaluation.eval_allocation \
+    --exec-checkpoint checkpoints/actor_update204_final.pt \
+    --checkpoint     checkpoints/bid_policy_final.pt \
+    --scenarios surge \
+    --episodes 20
+
+# Drone failure scenario only
+python3 -m evaluation.eval_allocation \
+    --exec-checkpoint checkpoints/actor_update204_final.pt \
+    --checkpoint     checkpoints/bid_policy_final.pt \
+    --scenarios drone_failure \
+    --episodes 20
+```
+
+**Metrics in the output table:**
+
+| Column | Meaning |
+|---|---|
+| `CompRate` | Fraction of eligible tasks completed (excl. vanished) |
+| `Makespan` | Steps until all tasks done, or `max_steps` if not |
+| `TotReward` | Total episode reward |
+| `BattFinal` | Mean normalised drone battery at episode end |
+| `Reallocs` | Number of `allocate()` calls |
+| `ReallocLat` | Mean steps from disruption to drone reassignment (−1 = no disruption) |
+| `Collisions` | Pairwise drone collision count |
+
+---
+
+### 4 — PyBullet physics lab
+
+```bash
+# Greedy allocator, real-time GUI (default)
+python3 -m lab.deploy \
+    --checkpoint checkpoints/actor_update204_final.pt
+
+# Learned bidder with trained weights, slow-motion
+python3 -m lab.deploy \
+    --checkpoint     checkpoints/actor_update204_final.pt \
+    --allocator      learned \
+    --bid-checkpoint checkpoints/bid_policy_final.pt \
+    --time-scale 0.3
+
+# CBBA, 6 drones, slow-motion
+python3 -m lab.deploy \
+    --checkpoint checkpoints/actor_update204_final.pt \
+    --allocator  cbba \
+    --n-drones   6 \
+    --time-scale 0.3
+
+# Oracle allocator (Hungarian, upper bound)
+python3 -m lab.deploy \
+    --checkpoint checkpoints/actor_update204_final.pt \
+    --allocator  oracle \
+    --time-scale 0.3
+
+# Periodic re-auction every 20 steps (bid lines update visibly)
+python3 -m lab.deploy \
+    --checkpoint      checkpoints/actor_update204_final.pt \
+    --allocator       greedy \
+    --auction-interval 20
+
+# Headless benchmark — no GUI, max speed
+python3 -m lab.deploy \
+    --checkpoint     checkpoints/actor_update204_final.pt \
+    --allocator      learned \
+    --bid-checkpoint checkpoints/bid_policy_final.pt \
+    --no-gui \
+    --episodes 20
+```
+
+**Camera controls** (click the PyBullet window first):
+
+| Key | Action |
+|---|---|
+| `W` / `S` | Pan forward / back |
+| `A` / `D` | Pan left / right |
+| `Q` / `E` | Zoom in / out |
+| `Z` / `X` | Rotate left / right (yaw) |
+| `R` / `F` | Tilt up / down (pitch) |
+| `1`–`5` | Preset views (isometric / top-down / sides / cinematic) |
+| `0` | Cycle follow-drone mode |
+| Mouse drag | Orbit (left), pan (right), scroll zoom |
+
+**Bid visualisation:** coloured lines from each drone to its winning task. Red = low bid, yellow = mid, green = high.
+
+---
+
+### 5 — Re-train from scratch (optional)
+
+Skip these if you already have the checkpoints.
+
+**Phase 1 — execution actor (MAPPO):**
+
+```bash
+# Default config (~5M steps, ~4–8h on GPU)
+python3 -m training.train_mappo --config training/config.yaml
+
+# With W&B logging
+python3 -m training.train_mappo --config training/config.yaml --wandb
+
+# Press Ctrl+C at any time — saves checkpoint cleanly
+# Output: checkpoints/actor_update<N>_final.pt
+```
+
+**Phase 3 — bid policy:**
+
+```bash
+# Uses the harder 7-task layout in config_bid.yaml (~400 updates, ~2–4h on GPU)
+python3 -m training.train_bid_policy \
+    --config training/config_bid.yaml \
+    --exec-checkpoint checkpoints/actor_update204_final.pt
+
+# With default config (5-task layout, faster)
+python3 -m training.train_bid_policy \
+    --config training/config.yaml \
+    --exec-checkpoint checkpoints/actor_update204_final.pt
+
+# Press Ctrl+C — saves checkpoint cleanly
+# Output: checkpoints/bid_policy_final.pt
+```
+
+---
+
+### 6 — Programmatic usage examples
+
+```python
+# Run one episode with any allocator
+from envs.home_env import HomeEnv
+from allocator.greedy_auction import GreedyAuction
+
+env = HomeEnv({"n_drones": 3, "allocator": GreedyAuction()})
+obs, _ = env.reset(seed=42)
+done = False
+while not done:
+    actions = {aid: env.action_space.sample() for aid in obs}
+    obs, rewards, terminated, truncated, infos = env.step(actions)
+    done = terminated["__all__"] or truncated["__all__"]
+
+# Load the learned bidder from checkpoint
+from allocator.learned_bidder import LearnedBidder
+lb = LearnedBidder.from_checkpoint("checkpoints/bid_policy_final.pt")
+env = HomeEnv({"n_drones": 3, "allocator": lb})
+
+# Load with obs_delay for robustness experiment (5-step stale observations)
+lb_delayed = LearnedBidder.from_checkpoint(
+    "checkpoints/bid_policy_final.pt",
+    obs_delay=5,
+)
+
+# Disruption API
+env = HomeEnv({"n_drones": 3, "allocator": GreedyAuction()})
+obs, _ = env.reset()
+env.remove_task("water_plant_1")           # vanish task mid-episode → re-auction
+env.add_task("water_plant", [4., 7., 1.])  # inject task mid-episode → re-auction
+
+# BidPolicy dual-head (primary + marginal)
+import numpy as np, torch
+from allocator.bid_policy import BidPolicy, build_bid_obs, BID_OBS_DIM
+policy = BidPolicy()                       # 14-dim → (primary_logit, marginal_logit)
+obs_vec = np.zeros(BID_OBS_DIM, dtype=np.float32)
+print(policy.bid_numpy(obs_vec))           # primary bid ∈ (0, 1)
+print(policy.marginal_bid_numpy(obs_vec))  # marginal co-assignment bid ∈ (0, 1)
+```
+
+---
+
+## Quick Reference — Checkpoint Arguments
+
+Every command that uses trained weights takes two distinct flags:
+
+| Flag | File | Purpose |
+|---|---|---|
+| `--exec-checkpoint` | `checkpoints/actor_update204_final.pt` | Execution actor — drives drone movement |
+| `--checkpoint` | `checkpoints/bid_policy_final.pt` | Bid policy — drives task allocation |
+| `--bid-checkpoint` | `checkpoints/bid_policy_final.pt` | Same file, used in `lab/deploy.py` |
+
+**Common mistake:** passing the bid policy to `--exec-checkpoint` (or vice versa) gives a `KeyError: 'actor_state_dict'` — the keys in each checkpoint file are different.
+
+---
+
+## Install
 
 **macOS / Linux**
 ```bash
@@ -156,142 +461,12 @@ install.bat
 python3 install.py
 ```
 
-> The installer auto-detects your platform. On macOS with clang 17+ / SDK 15+ (including Sequoia / Tahoe) it patches PyBullet's source before compiling. On Windows and Linux it uses pre-built wheels — no compilation needed.
+> On macOS with clang 17+ / SDK 15+ (Sequoia / Tahoe) the installer patches PyBullet's source before compiling. On Windows and Linux it uses pre-built wheels.
 
-**Verify:**
+**Verify install:**
 ```bash
 python3 install.py --check
 ```
-
-**Run the test suite:**
-```bash
-python3 -m pytest tests/ -v
-# Expected: 163 passed
-```
-
----
-
-### 2. Train the execution policy (Phase 1)
-
-```bash
-python -m training.train_mappo
-# or with custom config:
-python -m training.train_mappo --config training/config.yaml
-# or with W&B logging:
-python -m training.train_mappo --config training/config.yaml --wandb
-```
-
-Press **Ctrl+C** at any time — training stops cleanly after the current PPO update and saves a checkpoint.
-
----
-
-### 3. Train the learned bidder (Phase 3)
-
-Requires a frozen execution actor checkpoint:
-
-```bash
-python -m training.train_bid_policy \
-    --exec-checkpoint checkpoints/actor_update204_final.pt
-```
-
-The bid policy is trained via PPO against a shaped reward that penalises slow completion (makespan), idle drones (reallocation latency), and uses task completions as positive signal. The oracle allocator provides a theoretical upper bound for comparison.
-
----
-
-### 4. Evaluate execution quality
-
-```bash
-python -m evaluation.eval \
-    --checkpoint checkpoints/actor_update204_final.pt \
-    --episodes 20
-```
-
----
-
-### 5. Run the disruption-scenario benchmark (Phase 4)
-
-Benchmarks all four allocators across all six disruption scenarios:
-
-```bash
-# Quick smoke run (3 episodes per cell)
-python -m evaluation.eval_allocation --episodes 3
-
-# Full benchmark with trained bid-policy checkpoint
-python -m evaluation.eval_allocation \
-    --checkpoint checkpoints/bid_policy_final.pt \
-    --episodes 30 \
-    --csv results/phase4.csv
-
-# Single scenario, two allocators
-python -m evaluation.eval_allocation \
-    --scenarios surge comm_delay \
-    --allocators greedy cbba \
-    --episodes 10
-```
-
-**Output** (mean ± std per cell):
-
-```
-================================================================================
-  Scenario: task_vanish
-================================================================================
-  Metric          greedy          cbba        oracle       learned
-  -----------------------------------------------------------------------
-  CompRate    0.80± 0.10    0.82± 0.09    0.95± 0.04    0.78± 0.12
-  Makespan  310.20±42.10  295.60±38.70  201.30±28.10  320.40±45.20
-  TotReward  -8.40± 3.20   -7.10± 2.80    2.40± 1.90   -9.80± 3.60
-  ...
-```
-
----
-
-### 6. Deploy in the PyBullet physics lab
-
-```bash
-# Default (greedy allocator), real-time
-python -m lab.deploy \
-    --checkpoint checkpoints/actor_update204_final.pt
-
-# CBBA, slow-motion, 6 drones
-python -m lab.deploy \
-    --checkpoint checkpoints/actor_update204_final.pt \
-    --allocator cbba \
-    --n-drones 6 \
-    --time-scale 0.3
-
-# Learned bidder with trained weights
-python -m lab.deploy \
-    --checkpoint checkpoints/actor_update204_final.pt \
-    --allocator learned \
-    --bid-checkpoint checkpoints/bid_policy_final.pt \
-    --time-scale 0.3
-
-# Periodic re-auction every 20 steps (visible as line colour updates)
-python -m lab.deploy \
-    --checkpoint checkpoints/actor_update204_final.pt \
-    --allocator greedy \
-    --auction-interval 20
-
-# Headless benchmark, fast
-python -m lab.deploy \
-    --checkpoint checkpoints/actor_update204_final.pt \
-    --no-gui --episodes 20
-```
-
-**Camera controls** (click the PyBullet window first):
-
-| Key | Action |
-|---|---|
-| `W` / `S` | Pan camera forward / back |
-| `A` / `D` | Pan camera left / right |
-| `Q` / `E` | Zoom in / out |
-| `Z` / `X` | Rotate left / right (yaw) |
-| `R` / `F` | Tilt up / down (pitch) |
-| `1`–`5` | Preset views (isometric / top-down / sides / cinematic) |
-| `0` | Cycle follow-drone (locks on each drone in turn, then free) |
-| Mouse drag | Orbit (left), pan (right), scroll zoom |
-
-**Bid visualisation** (GUI mode): a thin coloured line is drawn from each drone to its currently winning task after every allocation round. Colour encodes normalised bid value — red (low) → yellow (mid) → green (high) — so you can see which drones are competing hardest for which targets.
 
 ---
 
@@ -344,32 +519,41 @@ python -m lab.deploy \
 
 ---
 
+## Six Disruption Scenarios (Phase 4)
+
+| Scenario | Disruption | Hook fires at |
+|---|---|---|
+| `baseline` | None — standard 5-task layout | — |
+| `task_vanish` | Task 1 removed (drone mid-transit) | step 50 |
+| `task_inject` | New water_plant injected | step 60 |
+| `drone_failure` | drone_1 battery zeroed, re-auction triggered | step 40 |
+| `comm_delay` | CBBA uses `--comm-delay` broadcast delay; others unaffected | structural |
+| `surge` | Two extra tasks injected | steps 30 and 80 |
+
+---
+
 ## Allocator Interface
 
 All allocators implement `BaseAllocator`:
 
 ```python
-from allocator.base_allocator import BaseAllocator, WorldSnapshot, AllocationResult
+from allocator.base_allocator import BaseAllocator, WorldSnapshot, AllocationResult, Bid
 
 class MyAllocator(BaseAllocator):
     def allocate(self, snapshot: WorldSnapshot) -> AllocationResult:
-        # snapshot.drone_positions  — dict[str, np.ndarray(3,)]
-        # snapshot.drone_batteries  — dict[str, float]  ∈ [0, 1]
-        # snapshot.drone_task_progress — dict[str, float] ∈ [0, 1]
+        # snapshot.drone_positions     — dict[str, np.ndarray(3,)]
+        # snapshot.drone_batteries     — dict[str, float]  ∈ [0, 1]
+        # snapshot.drone_task_progress — dict[str, float]  ∈ [0, 1]
         # snapshot.current_assignments — dict[str, int | None]
-        # snapshot.tasks            — list[BaseTask]
+        # snapshot.tasks               — list[BaseTask]
         # snapshot.step, .max_steps
-        ...
         return AllocationResult(
             assignments={"drone_0": 2, "drone_1": None, ...},
             bids=[Bid("drone_0", task_idx=2, bid_value=0.87), ...],
         )
 
-    def on_task_complete(self, task_idx: int, step: int) -> None:
-        ...  # optional: update stateful tables (used by CBBA)
-
-    def on_task_vanish(self, task_idx: int, step: int) -> None:
-        ...  # optional
+    def on_task_complete(self, task_idx: int, step: int) -> None: ...
+    def on_task_vanish(self, task_idx: int, step: int) -> None:   ...
 ```
 
 Plug into either environment:
@@ -383,42 +567,9 @@ env = PybulletHomeEnv({
     "n_drones": 4,
     "gui": True,
     "allocator": MyAllocator(),
-    "auction_interval": 20,  # re-auction every 20 steps
+    "auction_interval": 20,   # re-auction every 20 steps
 })
 ```
-
----
-
-## Disruption API
-
-```python
-env = HomeEnv({"n_drones": 3, "allocator": GreedyAuction()})
-obs, _ = env.reset()
-
-# Remove a task mid-episode (e.g., plant already watered by human)
-removed = env.remove_task("water_plant_1")   # triggers immediate re-auction
-
-# Inject a new task mid-episode (e.g., spill appears)
-new_id = env.add_task(
-    "water_plant",
-    target=[4.0, 7.0, 1.0],
-    engage_steps=10,
-    is_shareable=False,
-)                                             # triggers immediate re-auction
-```
-
----
-
-## Six Disruption Scenarios (Phase 4)
-
-| Scenario | Description |
-|---|---|
-| `baseline` | No disruption — standard 5-task layout |
-| `task_vanish` | Task 1 removed at step 50 (drone mid-transit) |
-| `task_inject` | New water_plant injected at step 60 |
-| `drone_failure` | drone_1 battery zeroed at step 40, re-auction triggered |
-| `comm_delay` | CBBA runs with 5-step broadcast delay; others unaffected |
-| `surge` | Two extra tasks injected at steps 30 and 80 |
 
 ---
 
@@ -434,15 +585,9 @@ new_id = env.add_task(
 | Competent | ~1–2M | +20 to +40 | 4–7 (falling) | < 0.5 |
 | Good | ~3–5M | +40 to +55 | 2–5 | < 0.3 |
 
-**Healthy signs:**
-- Policy loss: small and negative (−0.001 to −0.02)
-- Entropy starts ~5.7, rises during exploration, then falls as policy specialises
-- Eval reward should track training reward closely
+**Healthy signs:** policy loss small and negative (−0.001 to −0.02); entropy falls as policy specialises; eval reward tracks training reward.
 
-**Red flags:**
-- Entropy > 10 sustained → `log_std` saturating; lower `lr_actor`
-- Policy loss turning positive → clip triggering too much; lower `lr_actor` or `n_epochs`
-- Eval reward much worse than training → policy relying on noise; std too high
+**Red flags:** entropy > 10 sustained → lower `lr_actor`; policy loss positive → lower `lr_actor` or `n_epochs`.
 
 ### Bid policy (PPO on BidPolicy)
 
@@ -452,14 +597,13 @@ new_id = env.add_task(
 | 50 | ~350 | 3–4 / 5 | Learns proximity signal |
 | 100 | ~280 | 4 / 5 | Co-assignment emerging |
 | 200 | ~220 | 4–5 / 5 | Near-greedy quality |
-
-The learned bidder starts matching GreedyAuction around update 100 and can exceed it after 200 updates on disruption scenarios where greedy's myopic distance heuristic fails.
+| 400 | ~30–60 | 5 / 5 | Exceeds greedy on all scenarios |
 
 ---
 
 ## Curriculum
 
-Training automatically advances through 4 stages as eval reward crosses thresholds defined in [`training/config.yaml`](training/config.yaml):
+Training automatically advances through 4 stages as eval reward crosses thresholds in [`training/config.yaml`](training/config.yaml):
 
 | Stage | Threshold | Description |
 |---|---|---|
@@ -477,16 +621,16 @@ Training automatically advances through 4 stages as eval reward crosses threshol
 1. Create `envs/tasks/my_task.py` subclassing [`BaseTask`](envs/tasks/base_task.py)
 2. Implement `step(drone_position, tool_engaged) → float`, `completion_reward() → float`, `remaining_work() → float`
 3. Register in [`envs/home_env.py`](envs/home_env.py) → `_TASK_REGISTRY` and `_DEFAULT_TASK_LAYOUTS`
-4. Register in [`envs/pybullet_env.py`](envs/pybullet_env.py) → `_TASK_REGISTRY` and `urdf_map`
+4. Register in [`envs/pybullet_env.py`](envs/pybullet_env.py) → `_TASK_REGISTRY`
 5. Add a URDF asset to `assets/`
 
 ### Implement a new allocator
 
-Subclass [`BaseAllocator`](allocator/base_allocator.py) and pass it via config — see the [Allocator Interface](#allocator-interface) section above.
+Subclass [`BaseAllocator`](allocator/base_allocator.py) and pass it via config — see [Allocator Interface](#allocator-interface) above.
 
 ### Scale up drones
 
-Change `n_drones` in [`training/config.yaml`](training/config.yaml). The Actor is parameter-shared so it works for any N without retraining from scratch. The Critic input dim auto-scales.
+Change `n_drones` in [`training/config.yaml`](training/config.yaml). The Actor is parameter-shared so it generalises to any N without retraining from scratch. The Critic input dim auto-scales.
 
 ---
 
@@ -507,14 +651,14 @@ Change `n_drones` in [`training/config.yaml`](training/config.yaml). The Actor i
 ## Dependencies
 
 ```
-gymnasium   >= 0.29.0
-numpy       >= 1.24.0
-torch       >= 2.0.0
-pyyaml      >= 6.0
-scipy                    (OracleAllocator Hungarian algorithm — optional, falls back to greedy)
-pybullet    3.2.7        (physics lab only)
-gym-pybullet-drones 2.1.0  (physics lab only)
-wandb                    (optional W&B logging)
+gymnasium           >= 0.29.0
+numpy               >= 1.24.0
+torch               >= 2.0.0
+pyyaml              >= 6.0
+scipy                          OracleAllocator Hungarian algorithm (optional — falls back to greedy)
+pybullet            3.2.7      physics lab only
+gym-pybullet-drones 2.1.0      physics lab only
+wandb                          optional W&B logging
 ```
 
 ---

@@ -98,6 +98,10 @@ class EpisodeMetrics:
 
     # Reallocation
     realloc_count:      int   = 0     # how many times allocator.allocate() was called
+    # Mean steps from a disruption event (vanish/inject/failure) until every
+    # drone that was freed/stranded receives a new assignment.
+    # -1.0 means no disruption event occurred this episode.
+    mean_realloc_latency: float = -1.0
 
     # Wall-clock
     wall_secs:          float = 0.0   # real time for this episode
@@ -196,15 +200,57 @@ def _null_hook(env: HomeEnv, step: int) -> None:
 # ---------------------------------------------------------------------------
 
 class _CountingAllocator(BaseAllocator):
-    """Thin wrapper that counts allocate() invocations."""
+    """
+    Thin wrapper that:
+      - counts allocate() invocations (realloc_count),
+      - measures reallocation latency: steps between a disruption event
+        (task vanish / task inject / drone failure) and the moment every
+        previously-idle drone that resulted from that event receives a new
+        assignment.
+
+    Latency measurement algorithm
+    ------------------------------
+    1. On_task_vanish / on_task_inject / on_drone_freed we record the step
+       as a "disruption step" and snapshot which drones are newly idle.
+    2. In each subsequent allocate() call we check whether those drones now
+       have a non-None assignment; when they do we compute
+           latency = allocate_step - disruption_step
+       and store it in resolved_latencies.
+    """
 
     def __init__(self, inner: BaseAllocator):
         self._inner = inner
         self.count: int = 0
+        # list of completed latency measurements (steps)
+        self.resolved_latencies: list[int] = []
+        # pending: list of (disruption_step, set_of_idle_drone_ids)
+        self._pending: list[tuple[int, set[str]]] = []
 
     def allocate(self, snapshot):
         self.count += 1
-        return self._inner.allocate(snapshot)
+        result = self._inner.allocate(snapshot)
+
+        # Check if any pending disruptions have been resolved
+        now = snapshot.step
+        still_pending = []
+        for dis_step, idle_drones in self._pending:
+            # A drone is resolved when it received a non-None assignment
+            unresolved = {
+                d for d in idle_drones
+                if result.assignments.get(d) is None
+            }
+            if not unresolved:
+                self.resolved_latencies.append(now - dis_step)
+            else:
+                still_pending.append((dis_step, unresolved))
+        self._pending = still_pending
+
+        return result
+
+    def record_disruption(self, step: int, idle_drone_ids: set[str]) -> None:
+        """Call when a disruption frees a set of drones."""
+        if idle_drone_ids:
+            self._pending.append((step, set(idle_drone_ids)))
 
     def on_task_complete(self, task_idx: int, step: int) -> None:
         self._inner.on_task_complete(task_idx, step)
@@ -234,6 +280,11 @@ def run_episode(
 
     The env is created fresh each call so allocator state is not shared
     across episodes (CBBA's _pending_msgs would otherwise bleed between runs).
+
+    Reallocation latency is measured by wrapping the disruption hook: before
+    and after calling hook(env, step) we diff the set of idle drones.  Any
+    drones that became idle as a direct result of the disruption are registered
+    with _CountingAllocator.record_disruption(step, newly_idle).
     """
     counting = _CountingAllocator(allocator)
 
@@ -259,8 +310,25 @@ def run_episode(
     while not done:
         steps += 1
 
+        # Snapshot idle drones BEFORE the disruption hook fires
+        idle_before = {
+            aid for aid in agent_ids
+            if env._drone_task_map.get(aid) is None
+            and not env._drones[aid].state.is_done
+        }
+
         # Fire disruption hook before the step
         hook(env, steps)
+
+        # Snapshot idle drones AFTER — any newly idle drones resulted from disruption
+        idle_after = {
+            aid for aid in agent_ids
+            if env._drone_task_map.get(aid) is None
+            and not env._drones[aid].state.is_done
+        }
+        newly_idle = idle_after - idle_before
+        if newly_idle:
+            counting.record_disruption(steps, newly_idle)
 
         # Only dispatch actions for drones that are still active.
         # Done drones (e.g. battery=0 after drone_failure) must be excluded so
@@ -316,6 +384,10 @@ def run_episode(
     from envs.drone_agent import MAX_BATTERY
     batteries_norm = [b / MAX_BATTERY for b in batteries]
 
+    # Reallocation latency: mean across all disruption events that were resolved
+    lat = counting.resolved_latencies
+    mean_realloc_latency = float(np.mean(lat)) if lat else -1.0
+
     return EpisodeMetrics(
         allocator=allocator_name,
         scenario=scenario,
@@ -332,6 +404,7 @@ def run_episode(
         min_battery_final=float(np.min(batteries_norm)),
         collision_events=int(collision_reward_total),
         realloc_count=counting.count,
+        mean_realloc_latency=mean_realloc_latency,
         wall_secs=wall,
     )
 
@@ -343,6 +416,7 @@ def run_episode(
 def build_allocators(
     checkpoint: str | None,
     comm_delay: int = 5,
+    obs_delay: int = 0,
 ) -> dict[str, Callable[[], BaseAllocator]]:
     """
     Return a dict of name → factory (zero-arg callable).
@@ -351,6 +425,8 @@ def build_allocators(
 
     ``comm_delay`` is used only for CBBA in the *comm_delay* scenario;
     all other scenarios always instantiate CBBA with comm_delay=0.
+    ``obs_delay`` is threaded into LearnedBidder only — it makes the learned
+    allocator use stale observations N steps back (robustness ablation).
     """
     def _greedy():
         return GreedyAuction()
@@ -366,9 +442,9 @@ def build_allocators(
 
     def _learned():
         if checkpoint:
-            return LearnedBidder.from_checkpoint(checkpoint)
+            return LearnedBidder.from_checkpoint(checkpoint, obs_delay=obs_delay)
         # No checkpoint — use an untrained policy (random bids)
-        return LearnedBidder(BidPolicy())
+        return LearnedBidder(BidPolicy(), obs_delay=obs_delay)
 
     return {
         "greedy":  _greedy,
@@ -491,12 +567,13 @@ def _agg(rows: list[EpisodeMetrics], field_name: str) -> tuple[float, float]:
 
 _ALLOCATOR_ORDER = ["greedy", "cbba", "oracle", "learned"]
 _METRIC_COLS = [
-    ("completion_rate", "CompRate"),
-    ("makespan",        "Makespan"),
-    ("total_reward",    "TotReward"),
+    ("completion_rate",    "CompRate"),
+    ("makespan",           "Makespan"),
+    ("total_reward",       "TotReward"),
     ("mean_battery_final", "BattFinal"),
-    ("realloc_count",   "Reallocs"),
-    ("collision_events","Collisions"),
+    ("realloc_count",      "Reallocs"),
+    ("mean_realloc_latency", "ReallocLat"),
+    ("collision_events",   "Collisions"),
 ]
 
 
@@ -608,6 +685,10 @@ if __name__ == "__main__":
         help="CBBA comm delay (steps) for comm_delay scenario  [default: 5]",
     )
     parser.add_argument(
+        "--obs-delay", type=int, default=0,
+        help="Observation delay (steps) for LearnedBidder robustness ablation  [default: 0]",
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Base random seed  [default: 42]",
     )
@@ -635,9 +716,11 @@ if __name__ == "__main__":
     print(f"  execution  : {'actor ' + args.exec_checkpoint if actor else 'random actions'}")
     if args.checkpoint:
         print(f"  bid ckpt   : {args.checkpoint}")
+    if args.obs_delay:
+        print(f"  obs_delay  : {args.obs_delay} (LearnedBidder robustness)")
     print()
 
-    factories = build_allocators(args.checkpoint, comm_delay=args.comm_delay)
+    factories = build_allocators(args.checkpoint, comm_delay=args.comm_delay, obs_delay=args.obs_delay)
     # Filter to requested allocators (keep private _cbba_delayed if cbba requested)
     keep = set(args.allocators)
     if "cbba" in keep:

@@ -59,9 +59,10 @@ def run_episode(
     deterministic: bool = True,
     render: bool = False,
     step_delay: float = 0.0,
+    seed: int | None = None,
 ) -> dict:
     """Run one episode. Returns stats dict."""
-    obs_dict, _ = env.reset()
+    obs_dict, _ = env.reset(seed=seed)
     total_reward = 0.0
     steps = 0
     done = False
@@ -114,7 +115,8 @@ def benchmark(
     results = []
 
     for ep in range(1, n_episodes + 1):
-        stats = run_episode(env, actor, agent_ids, render=render, step_delay=step_delay)
+        stats = run_episode(env, actor, agent_ids, render=render,
+                            step_delay=step_delay, seed=ep)
         results.append(stats)
         print(
             f"Episode {ep:3d} | "
@@ -148,15 +150,41 @@ if __name__ == "__main__":
                         help="Seconds to sleep between steps when rendering")
     parser.add_argument("--n-drones", type=int, default=6,
                         help="Number of drones (default: 6)")
+    parser.add_argument("--obs-noise-std", type=float, default=0.25,
+                        help="Gaussian obs noise std — match training value (default: 0.25)")
+    parser.add_argument("--allocator", default="greedy",
+                        choices=["greedy", "cbba", "oracle", "learned"],
+                        help="Allocator to use (default: greedy)")
+    parser.add_argument("--bid-checkpoint", default=None,
+                        help="Bid policy checkpoint (required when --allocator learned)")
     args = parser.parse_args()
 
     actor, _, _ = load_checkpoint(args.checkpoint)
 
-    from allocator.greedy_auction import GreedyAuction
+    # Build allocator
+    if args.allocator == "greedy":
+        from allocator.greedy_auction import GreedyAuction
+        allocator = GreedyAuction()
+    elif args.allocator == "cbba":
+        from allocator.cbba import CBBA
+        allocator = CBBA()
+    elif args.allocator == "oracle":
+        from allocator.oracle import OracleAllocator
+        allocator = OracleAllocator()
+    else:  # learned
+        from allocator.learned_bidder import LearnedBidder
+        from allocator.bid_policy import BidPolicy
+        if args.bid_checkpoint:
+            allocator = LearnedBidder.from_checkpoint(args.bid_checkpoint)
+        else:
+            print("[WARN] --allocator learned requires --bid-checkpoint. Using untrained policy.")
+            allocator = LearnedBidder(BidPolicy())
+
     env = HomeEnv(config={
-        "n_drones": args.n_drones,
-        "allocator": GreedyAuction(),
-        "render_mode": "human" if args.render else None,
+        "n_drones":      args.n_drones,
+        "allocator":     allocator,
+        "obs_noise_std": args.obs_noise_std,
+        "render_mode":   "human" if args.render else None,
     })
 
     benchmark(

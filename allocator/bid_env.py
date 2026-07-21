@@ -108,6 +108,14 @@ class BidEnv:
     The BidPolicy is called once per (drone, task) pair per auction round.
     The resulting bids are assembled into an AllocationResult and applied
     to the environment.
+
+    obs_delay
+    ---------
+    When obs_delay > 0 the position and battery components of the bid
+    observation are taken from a circular history buffer instead of the
+    current-step values.  This mimics the communication delay in the CBBA
+    robustness experiment: the bidding policy must decide with stale sensor
+    data, testing robustness to sensing/communication latency.
     """
 
     def __init__(
@@ -117,12 +125,14 @@ class BidEnv:
         bid_policy: BidPolicy,
         bid_value_net,      # Small critic for bid-policy PPO (BidValueNet)
         device: str = "cpu",
+        obs_delay: int = 0, # steps of observation delay (0 = no delay)
     ):
         self.env = home_env
         self.exec_actor = exec_actor
         self.bid_policy = bid_policy
         self.bid_value_net = bid_value_net
         self.device = device
+        self.obs_delay = obs_delay
 
         # Replace env's allocator with our learned one (injected after construction)
         self._learned_allocator: _InternalLearnedAllocator | None = None
@@ -135,7 +145,8 @@ class BidEnv:
         """
         buffer = BidBuffer()
         alloc = _InternalLearnedAllocator(
-            self.bid_policy, self.bid_value_net, buffer, self.device
+            self.bid_policy, self.bid_value_net, buffer, self.device,
+            obs_delay=self.obs_delay,
         )
         self.env.allocator = alloc
 
@@ -197,6 +208,10 @@ class _InternalLearnedAllocator(BaseAllocator):
     """
     Allocator used exclusively inside BidEnv.collect_episode().
     Calls BidPolicy for each (drone, task) pair and stores transitions.
+
+    When obs_delay > 0, drone positions and batteries seen by the bid
+    observation are taken from a history buffer that is obs_delay steps stale.
+    This allows apples-to-apples robustness comparison with CBBA's comm_delay.
     """
 
     def __init__(
@@ -205,13 +220,18 @@ class _InternalLearnedAllocator(BaseAllocator):
         value_net,
         buffer: BidBuffer,
         device: str,
+        obs_delay: int = 0,
     ):
         self.policy = policy
         self.value_net = value_net
         self.buffer = buffer
         self.device = device
+        self.obs_delay = obs_delay
         self.n_reallocations = 0
         self._last_bid_indices: list[int] = []  # indices into buffer for reward assignment
+        # Circular history buffer: list of snapshots (positions, batteries)
+        # at most obs_delay entries deep.
+        self._obs_history: list[tuple[dict, dict]] = []
 
     def allocate(self, snapshot: WorldSnapshot) -> AllocationResult:
         self.n_reallocations += 1
@@ -225,31 +245,51 @@ class _InternalLearnedAllocator(BaseAllocator):
                 assignments={d: None for d in snapshot.drone_positions},
             )
 
+        # Update the obs history buffer with the current positions/batteries.
+        # Keep only obs_delay entries so index 0 is the stalest available.
+        self._obs_history.append(
+            (dict(snapshot.drone_positions), dict(snapshot.drone_batteries))
+        )
+        if len(self._obs_history) > max(self.obs_delay, 1):
+            self._obs_history.pop(0)
+
+        # Use delayed observations when enough history has accumulated
+        if self.obs_delay > 0 and len(self._obs_history) >= self.obs_delay:
+            delayed_positions, delayed_batteries = self._obs_history[0]
+        else:
+            delayed_positions  = snapshot.drone_positions
+            delayed_batteries  = snapshot.drone_batteries
+
         all_bids: list[Bid] = []
         self._last_bid_indices = []
 
         for drone_id, pos in snapshot.drone_positions.items():
-            batt = snapshot.drone_batteries.get(drone_id, 1.0)
+            # Use stale pos/battery for bid obs; current progress is always fresh
+            delayed_pos  = delayed_positions.get(drone_id, pos)
+            batt = delayed_batteries.get(drone_id, 1.0)
             progress = snapshot.drone_task_progress.get(drone_id, 0.0)
 
             for task_idx, task in active_tasks:
                 obs = build_bid_obs(
-                    pos, batt, progress, task,
+                    delayed_pos, batt, progress, task,
                     snapshot.step, snapshot.max_steps,
                 )
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
                 with torch.no_grad():
-                    logit = self.policy.forward(obs_t).item()
-                    bid_val = float(torch.sigmoid(torch.tensor(logit)).item())
+                    primary_logit, marginal_logit = self.policy.forward(obs_t)
+                    primary_logit  = primary_logit.item()
+                    marginal_logit = marginal_logit.item()
+                    bid_val     = float(torch.sigmoid(torch.tensor(primary_logit)).item())
+                    marginal_val = float(torch.sigmoid(torch.tensor(marginal_logit)).item())
                     log_prob = float(
-                        torch.distributions.Bernoulli(logits=torch.tensor(logit)).log_prob(
+                        torch.distributions.Bernoulli(logits=torch.tensor(primary_logit)).log_prob(
                             torch.tensor(1.0)
                         ).item()
                     )
                     value = float(self.value_net(obs_t).item()) if self.value_net else 0.0
 
-                t = BidTransition(obs=obs, action=logit, log_prob=log_prob, value=value)
+                t = BidTransition(obs=obs, action=primary_logit, log_prob=log_prob, value=value)
                 idx = len(self.buffer.transitions)
                 self.buffer.add(t)
                 self._last_bid_indices.append(idx)
@@ -258,6 +298,7 @@ class _InternalLearnedAllocator(BaseAllocator):
                     drone_id=drone_id,
                     task_idx=task_idx,
                     bid_value=bid_val,
+                    marginal=marginal_val if task.spec.is_shareable else 0.0,
                 ))
 
         # Resolve: highest bid per task, each drone wins at most once
@@ -280,16 +321,16 @@ class _InternalLearnedAllocator(BaseAllocator):
                     assigned_drones.add(b.drone_id)
                     break
 
-        # Co-assignment for shareable tasks
+        # Co-assignment for shareable tasks — use the learned marginal bid
         idle_drones = [d for d in snapshot.drone_positions if d not in assigned_drones]
         for tidx, task in active_tasks:
             if not task.spec.is_shareable or task.remaining_work() < 0.4 or not idle_drones:
                 continue
             candidates = sorted(
                 [b for b in all_bids if b.task_idx == tidx and b.drone_id in idle_drones],
-                key=lambda b: b.bid_value, reverse=True,
+                key=lambda b: b.marginal, reverse=True,
             )
-            if candidates:
+            if candidates and candidates[0].marginal > 0:
                 best = candidates[0]
                 assignments[best.drone_id] = tidx
                 idle_drones.remove(best.drone_id)

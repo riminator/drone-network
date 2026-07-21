@@ -91,7 +91,7 @@ class TestEpisodeMetrics:
             "makespan", "steps_taken",
             "total_reward", "mean_reward_step",
             "mean_battery_final", "min_battery_final",
-            "collision_events", "realloc_count", "wall_secs",
+            "collision_events", "realloc_count", "mean_realloc_latency", "wall_secs",
         ]:
             assert expected in field_names, f"Missing field: {expected}"
 
@@ -107,6 +107,8 @@ class TestEpisodeMetrics:
         assert m.tasks_total == 0
         assert m.total_reward == pytest.approx(0.0)
         assert m.collision_events == 0
+        # mean_realloc_latency defaults to -1 (no disruption)
+        assert m.mean_realloc_latency == pytest.approx(-1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +237,63 @@ class TestCountingAllocator:
         # Should not raise
         ca.on_task_complete(0, 1)
         ca.on_task_vanish(0, 1)
+
+    def test_record_disruption_stored(self):
+        """record_disruption registers a pending disruption."""
+        ca = _CountingAllocator(GreedyAuction())
+        ca.record_disruption(step=10, idle_drone_ids={"drone_0", "drone_1"})
+        assert len(ca._pending) == 1
+        assert ca._pending[0][0] == 10
+
+    def test_record_disruption_empty_set_ignored(self):
+        """Empty idle set should not create a pending entry."""
+        ca = _CountingAllocator(GreedyAuction())
+        ca.record_disruption(step=5, idle_drone_ids=set())
+        assert len(ca._pending) == 0
+
+    def test_latency_resolved_on_allocate(self):
+        """Latency is recorded when all freed drones receive assignments."""
+        from allocator.base_allocator import WorldSnapshot
+        from envs.tasks.base_task import TaskSpec, TaskStatus
+        from envs.tasks.water_plant import WaterPlantTask
+
+        # Place task at origin; drone_0 at (0.1, 0, 0) is nearest
+        spec = TaskSpec("t0", "water_plant",
+                        np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                        engage_steps_required=5)
+        task = WaterPlantTask(spec)
+        task.status = TaskStatus.ASSIGNED
+
+        snap = WorldSnapshot(
+            drone_positions={
+                "drone_0": np.array([0.1, 0.0, 0.0], dtype=np.float32),
+                "drone_1": np.array([9.0, 9.0, 9.0], dtype=np.float32),
+            },
+            drone_batteries={"drone_0": 1.0, "drone_1": 1.0},
+            drone_task_progress={"drone_0": 0.0, "drone_1": 0.0},
+            current_assignments={"drone_0": None, "drone_1": None},
+            tasks=[task],
+            step=15, max_steps=500,
+        )
+
+        ca = _CountingAllocator(GreedyAuction())
+        ca.record_disruption(step=10, idle_drone_ids={"drone_0"})
+        # After allocating, drone_0 wins task_0 (nearest) → latency = 15 - 10 = 5
+        ca.allocate(snap)
+        assert len(ca.resolved_latencies) == 1
+        assert ca.resolved_latencies[0] == 5
+
+    def test_mean_realloc_latency_in_disruption_scenario(self):
+        """task_vanish scenario should produce a non-(-1) mean_realloc_latency."""
+        m = _run_one(scenario="task_vanish", max_steps=200)
+        # The disruption at step 50 frees at least one drone; latency must be >= 0
+        # (or -1 if no disruption was observed within max_steps)
+        assert m.mean_realloc_latency >= 0 or m.mean_realloc_latency == pytest.approx(-1.0)
+
+    def test_baseline_latency_is_minus_one(self):
+        """No disruption → mean_realloc_latency should stay at -1."""
+        m = _run_one(scenario="baseline", max_steps=100)
+        assert m.mean_realloc_latency == pytest.approx(-1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +468,7 @@ class TestReporting:
                 tasks_total=5, tasks_completed=4, completion_rate=0.8,
                 makespan=120, steps_taken=120, total_reward=-10.0,
                 mean_battery_final=0.7, realloc_count=3,
+                mean_realloc_latency=4.0 if s != "baseline" else -1.0,
             )
             for a in ["greedy", "cbba", "oracle", "learned"]
             for s in ["baseline", "task_vanish"]

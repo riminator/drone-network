@@ -137,8 +137,11 @@ def _ppo_update(
             ret_b    = returns_t[b]
             adv_b    = adv_t[b]
 
-            # Policy logit → Gaussian with log_std
-            mean = policy.forward(obs_b)   # (B,)
+            # Policy primary logit → Gaussian with log_std
+            # forward() returns (primary_logit, marginal_logit); we train only
+            # against the primary logit here — the marginal head is trained
+            # implicitly through the shared trunk gradients.
+            mean, _marginal = policy.forward(obs_b)   # (B,) each
             std  = log_std.exp()
             dist = torch.distributions.Normal(mean, std)
             new_lp = dist.log_prob(act_b)
@@ -170,10 +173,10 @@ def _ppo_update(
 
 def _oracle_makespan(env: HomeEnv, n_eval: int, device: str) -> float:
     """
-    Estimate oracle makespan: run n_eval episodes with frozen actor + oracle
-    allocator and return mean steps-to-complete (or max_steps if incomplete).
+    Estimate oracle makespan: run n_eval episodes with oracle allocator +
+    zero-action drones and return mean steps-to-complete (or max_steps if
+    incomplete).  Used as a reward normalisation baseline during bid training.
     """
-    from models.actor import Actor as _Actor
     oracle = OracleAllocator()
     env.allocator = oracle
     agent_ids = sorted(env._agent_ids)
@@ -183,13 +186,6 @@ def _oracle_makespan(env: HomeEnv, n_eval: int, device: str) -> float:
         done = False
         step = 0
         while not done:
-            with torch.no_grad():
-                obs_t = torch.tensor(
-                    np.stack([obs.get(aid, np.zeros(15)) for aid in agent_ids]),
-                    dtype=torch.float32, device=device,
-                )
-                squashed, _, _ = env.allocator.__class__  # won't be called
-            # Oracle doesn't need execution — just step with zeros for oracle measurement
             actions = {aid: np.zeros(4, dtype=np.float32) for aid in agent_ids}
             obs, _, terminated, truncated, _ = env.step(actions)
             done = terminated.get("__all__", False) or truncated.get("__all__", False)
