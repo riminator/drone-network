@@ -248,12 +248,20 @@ def train(cfg: dict, sim: str = "home", resume_checkpoint: str | None = None):
     if resume_checkpoint:
         ckpt = torch.load(resume_checkpoint, map_location=device, weights_only=False)
         actor.load_state_dict(ckpt["actor_state_dict"])
+        # Reset log_std to -0.5 (std≈0.6) so the resumed policy acts more
+        # deterministically. Checkpoints trained with broken rewards often have
+        # log_std near the ceiling (+0.5) → entropy 7.65 → pure noise even
+        # though the mean weights are good. Resetting lets PPO exploit the
+        # navigation the checkpoint already learned.
+        with torch.no_grad():
+            actor.log_std.fill_(-0.5)
         # Critic starts fresh — old critic was trained on different reward scale
         update_count      = ckpt.get("update", 0)
         timesteps_collected = ckpt.get("timesteps", 0)
         print(
             f"Resumed actor from {resume_checkpoint}\n"
             f"  update={update_count}  timesteps={timesteps_collected:,}\n"
+            f"  log_std reset to -0.5 (std≈0.6, entropy≈5.4)\n"
             f"  (critic re-initialised — reward scale changed)"
         )
 

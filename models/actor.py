@@ -27,7 +27,7 @@ class Actor(nn.Module):
     # Tighter ceiling prevents std from saturating to e^2 ≈ 7.4 and
     # pinning entropy near its maximum. e^0.5 ≈ 1.65 is plenty of exploration.
     LOG_STD_MIN = -3.0
-    LOG_STD_MAX = 0.5
+    LOG_STD_MAX = 0.0   # tightened: +0.5 ceiling let log_std pin at max (entropy 7.65)
 
     def __init__(
         self,
