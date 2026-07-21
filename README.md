@@ -49,7 +49,8 @@ The core contribution is replacing hand-crafted bidding heuristics with a **lear
 │  ENVIRONMENT LAYER                                                   │
 │                                                                      │
 │   HomeEnv          fast Python/NumPy sim (training + eval)           │
-│   PybulletHomeEnv  physics-backed sim (deployment + vis)             │
+│   MujocoHomeEnv    MuJoCo 3 physics sim  (recommended deploy)        │
+│   PybulletHomeEnv  PyBullet physics sim  (legacy deploy)             │
 │                                                                      │
 │   Tasks: WaterPlant · SweepFloor (shareable) · ToggleLight           │
 │   Disruptions: remove_task() · add_task() · drone battery failure    │
@@ -69,7 +70,11 @@ drone-network/
 │   ├── home_env.py           Fast training env — pure Python/NumPy
 │   │                           allocator plug-in via config["allocator"]
 │   │                           disruption API: remove_task() / add_task()
-│   ├── pybullet_env.py       Physics deployment env — real quadrotor dynamics
+│   ├── mujoco_env.py         MuJoCo 3 physics env (recommended deploy)
+│   │                           RK4 integrator @ 500 Hz, Newton contact solver
+│   │                           Crazyflie-scale quadrotor, attitude PID
+│   │                           render=True → passive viewer (no external deps)
+│   ├── pybullet_env.py       PyBullet physics env (legacy deploy)
 │   │                           auction tick every K steps (auction_interval)
 │   │                           real-time bid visualisation (coloured lines)
 │   ├── drone_agent.py        Single-drone kinematics & 15-dim obs builder
@@ -114,7 +119,8 @@ drone-network/
 │                               EpisodeMetrics (incl. mean_realloc_latency) + CSV export
 │
 ├── lab/
-│   └── deploy.py             Load checkpoint → PyBullet GUI
+│   └── deploy.py             Load checkpoint → physics GUI
+│                               --sim {pybullet,mujoco}  (backend selector)
 │                               --allocator {greedy,cbba,oracle,learned}
 │                               --auction-interval K  (periodic re-auction)
 │                               --bid-checkpoint (LearnedBidder weights)
@@ -173,7 +179,7 @@ python3 -m pytest tests/test_phase4.py -k "disruption" -v         # disruption h
 python3 -m pytest tests/ -k "shareable" -v                        # co-assignment
 ```
 
-Expected output: `176 passed`
+Expected output: `217 passed` (176 existing + 41 new MuJoCo tests)
 
 ---
 
@@ -292,7 +298,33 @@ python3 -m evaluation.eval_allocation \
 
 ---
 
-### 4 — PyBullet physics lab
+### 4 — MuJoCo physics lab (recommended)
+
+```bash
+# MuJoCo viewer — greedy allocator
+python3 -m lab.deploy \
+    --sim mujoco \
+    --checkpoint checkpoints/actor_update204_final.pt
+
+# MuJoCo — learned bidder + viewer
+python3 -m lab.deploy \
+    --sim mujoco \
+    --checkpoint     checkpoints/actor_update204_final.pt \
+    --allocator      learned \
+    --bid-checkpoint checkpoints/bid_policy_final.pt
+
+# MuJoCo headless (no GUI) — fast benchmark
+python3 -m lab.deploy \
+    --sim mujoco --no-gui \
+    --checkpoint checkpoints/actor_update204_final.pt \
+    --allocator cbba --episodes 10
+```
+
+**MuJoCo viewer controls:** Right-click + drag to rotate · scroll to zoom · double-click a body to track it.
+
+---
+
+### 5 — PyBullet physics lab (legacy)
 
 ```bash
 # Greedy allocator, real-time GUI (default)

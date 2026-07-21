@@ -4,6 +4,13 @@ torch>=2.0.0
 pyyaml>=6.0
 wandb>=0.15.0          # optional — set use_wandb: false in config.yaml to skip
 
-# Physics lab (deployment only — not needed for training)
+# MuJoCo physics backend (recommended — smoother, more controllable)
+mujoco>=3.0.0
+dm_control>=1.0.0
+absl-py                # required by dm_control
+dm_env                 # required by dm_control
+dm-tree                # required by dm_control
+
+# PyBullet physics backend (legacy — requires gym-pybullet-drones)
 # gym-pybullet-drones installs pybullet automatically
 # pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git

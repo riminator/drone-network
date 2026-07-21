@@ -1,35 +1,34 @@
 """
 deploy.py
-Deploy a trained policy checkpoint into the PyBullet physics lab.
+Deploy a trained policy checkpoint in the physics lab.
 
-Opens a GUI window showing the drone swarm navigating the household environment
-with real quadrotor aerodynamics.  The task allocator is selectable at the
-command line; bids are visualised in real-time as coloured lines from each
-drone to its currently winning task.
+Two simulator backends are available via --sim:
+  pybullet  (default) — PyBullet / gym-pybullet-drones, Crazyflie URDF
+  mujoco              — MuJoCo 3, custom Crazyflie-scale quadrotor XML
 
 Usage:
-    # Greedy allocator (default), real-time speed
-    python -m lab.deploy --checkpoint checkpoints/actor_update500_final.pt
+    # Greedy allocator (default), PyBullet GUI
+    python -m lab.deploy --checkpoint checkpoints/actor_update204_final.pt
 
-    # CBBA allocator, slow-motion
-    python -m lab.deploy --checkpoint checkpoints/actor_update500_final.pt \\
-        --allocator cbba --time-scale 0.3
+    # MuJoCo with viewer + CBBA allocator
+    python -m lab.deploy --checkpoint checkpoints/actor_update204_final.pt \\
+        --sim mujoco --allocator cbba
 
-    # Learned bidder with a trained bid-policy checkpoint
-    python -m lab.deploy --checkpoint checkpoints/actor_update500_final.pt \\
-        --allocator learned --bid-checkpoint checkpoints/bid_policy_final.pt
+    # MuJoCo, learned bidder, headless
+    python -m lab.deploy --checkpoint checkpoints/actor_update204_final.pt \\
+        --sim mujoco --allocator learned \\
+        --bid-checkpoint checkpoints/bid_policy_final.pt --no-gui
 
-    # Re-auction every 20 steps (rather than only on task completion)
-    python -m lab.deploy --checkpoint checkpoints/actor_update500_final.pt \\
+    # PyBullet, re-auction every 20 steps
+    python -m lab.deploy --checkpoint checkpoints/actor_update204_final.pt \\
         --auction-interval 20
 
-    # Headless benchmark, more drones, record video
-    python -m lab.deploy --checkpoint checkpoints/actor_update500_final.pt \\
-        --n-drones 4 --time-scale 0.3 --record --no-gui --episodes 20
-
-Controls (when GUI is open):
+Controls (PyBullet GUI):
     WASD pan  Q/E zoom  Z/X rotate  R/F pitch
     1-5  preset views   0  follow drone   mouse drag orbits
+
+Controls (MuJoCo viewer):
+    Right-click + drag to rotate, scroll to zoom, double-click to track body.
 """
 
 from __future__ import annotations
@@ -40,7 +39,6 @@ import time
 import numpy as np
 import torch
 
-from envs.pybullet_env import PybulletHomeEnv
 from models.actor import Actor
 
 
@@ -119,11 +117,35 @@ def build_allocator(name: str, bid_checkpoint: str | None):
 
 
 # ---------------------------------------------------------------------------
+# Env factory
+# ---------------------------------------------------------------------------
+
+def build_env(args: argparse.Namespace, allocator):
+    """Return a fresh PybulletHomeEnv or MujocoHomeEnv based on --sim."""
+    cfg = {
+        "n_drones":  args.n_drones,
+        "max_steps": args.max_steps,
+        "allocator": allocator,
+    }
+    if args.sim == "mujoco":
+        from envs.mujoco_env import MujocoHomeEnv
+        cfg["render"] = not args.no_gui
+        return MujocoHomeEnv(config=cfg)
+    else:
+        from envs.pybullet_env import PybulletHomeEnv
+        cfg["gui"]             = not args.no_gui
+        cfg["record"]          = args.record
+        cfg["time_scale"]      = args.time_scale
+        cfg["auction_interval"] = args.auction_interval
+        return PybulletHomeEnv(config=cfg)
+
+
+# ---------------------------------------------------------------------------
 # Episode runner
 # ---------------------------------------------------------------------------
 
 def run_episode(
-    env: PybulletHomeEnv,
+    env,
     actor: Actor,
     agent_ids: list[str],
     time_scale: float = 1.0,
@@ -191,27 +213,17 @@ def deploy(args: argparse.Namespace):
     if args.allocator == "learned" and args.bid_checkpoint:
         alloc_label = f"learned ({args.bid_checkpoint})"
 
-    env_cfg = {
-        "n_drones":        args.n_drones,
-        "max_steps":       args.max_steps,
-        "gui":             not args.no_gui,
-        "record":          args.record,
-        "time_scale":      args.time_scale,
-        "allocator":       allocator,
-        "auction_interval": args.auction_interval,
-    }
-
+    sim_label = "MuJoCo 3" if args.sim == "mujoco" else "PyBullet"
     print(
-        f"\nLaunching PyBullet env\n"
+        f"\nLaunching {sim_label} env\n"
+        f"  sim        : {args.sim}\n"
         f"  GUI        : {'on' if not args.no_gui else 'off'}\n"
         f"  drones     : {args.n_drones}\n"
         f"  allocator  : {alloc_label}\n"
-        f"  auction_interval: {args.auction_interval} "
-        f"({'periodic' if args.auction_interval > 0 else 'on-completion only'})\n"
         f"  time_scale : {args.time_scale}×\n"
     )
 
-    env = PybulletHomeEnv(config=env_cfg)
+    env = build_env(args, allocator)
     agent_ids = sorted(env._agent_ids)
 
     results = []
@@ -260,7 +272,11 @@ def deploy(args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Deploy a trained drone swarm policy in the PyBullet lab"
+        description="Deploy a trained drone swarm policy in the physics lab"
+    )
+    parser.add_argument(
+        "--sim", default="pybullet", choices=["pybullet", "mujoco"],
+        help="Physics simulator backend  [default: pybullet]",
     )
     parser.add_argument(
         "--checkpoint", required=True,

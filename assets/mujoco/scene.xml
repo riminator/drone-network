@@ -1,0 +1,425 @@
+<!--
+scene.xml  —  MuJoCo 3 household drone-swarm scene
+============================================================
+Room:      10 m × 10 m × 3 m (metric, z-up)
+Drones:    Crazyflie-scale quadrotor (wheelbase ~92 mm, mass ~27 g)
+           Four actuated rotors (two CW, two CCW) — realistic propeller
+           geometry and aerodynamic drag coefficients.
+Objects:   plant_pot (terracotta cylinder + foliage sphere)
+           floor_zone (large flat box, no collision — sweep target)
+           light_switch (wall-mounted box + toggle paddle)
+
+Coordinate convention:
+  x = East, y = North, z = Up
+  Drone spawns near floor (z=0.3) and climbs under thrust control.
+
+Physics settings:
+  integrator=RK4       — smooth numerical integration (vs Euler default)
+  timestep=0.002       — 500 Hz physics (Crazyflie runs at 500 Hz onboard)
+  iterations=20        — more solver iterations → fewer penetrations
+  solver=Newton        — smooth contact (vs PGS default)
+  impratio=10          — soft-contact ratio → less jitter on floor contact
+  wind                 — optional: set in code via mj_data.mocap_quat etc.
+  viscosity/density    — air density for realistic drag
+-->
+
+<mujoco model="drone_home">
+
+  <!-- ─── Compiler & global options ─────────────────────────────────── -->
+  <compiler angle="radian" autolimits="true"/>
+
+  <option
+    timestep="0.002"
+    gravity="0 0 -9.81"
+    integrator="RK4"
+    solver="Newton"
+    iterations="20"
+    tolerance="1e-10"
+    impratio="10"
+    density="1.2"
+    viscosity="1.8e-5"
+  />
+
+  <!-- ─── Assets: materials & meshes ────────────────────────────────── -->
+  <asset>
+    <!-- Floor -->
+    <texture name="floor_tex" type="2d" builtin="checker"
+             rgb1="0.85 0.82 0.78" rgb2="0.72 0.68 0.62"
+             width="512" height="512"/>
+    <material name="floor_mat" texture="floor_tex" texrepeat="10 10" reflectance="0.05"/>
+
+    <!-- Walls -->
+    <material name="wall_mat" rgba="0.90 0.88 0.85 1.0"/>
+
+    <!-- Drone body -->
+    <material name="drone_mat" rgba="0.15 0.15 0.15 1.0" specular="0.4" shininess="0.3"/>
+    <material name="arm_mat"   rgba="0.20 0.20 0.20 1.0"/>
+    <material name="prop_mat"  rgba="0.08 0.08 0.08 0.85" specular="0.2"/>
+
+    <!-- Household objects -->
+    <material name="terracotta" rgba="0.72 0.40 0.20 1.0"/>
+    <material name="foliage"    rgba="0.10 0.60 0.10 1.0" specular="0.05"/>
+    <material name="soil"       rgba="0.35 0.25 0.12 1.0"/>
+    <material name="zone_mat"   rgba="0.65 0.45 0.20 0.5"/>
+    <material name="switch_plate" rgba="0.95 0.95 0.95 1.0" specular="0.3"/>
+    <material name="switch_paddle" rgba="1.00 0.90 0.00 1.0" specular="0.2"/>
+
+    <!-- Per-drone accent colours (bodies are tinted via rgba override in each body) -->
+    <material name="drone0_mat" rgba="0.15 0.65 1.00 0.9" specular="0.5"/>
+    <material name="drone1_mat" rgba="1.00 0.45 0.05 0.9" specular="0.5"/>
+    <material name="drone2_mat" rgba="0.20 0.90 0.35 0.9" specular="0.5"/>
+    <material name="drone3_mat" rgba="0.90 0.15 0.80 0.9" specular="0.5"/>
+    <material name="drone4_mat" rgba="1.00 0.95 0.10 0.9" specular="0.5"/>
+    <material name="drone5_mat" rgba="0.10 0.85 0.90 0.9" specular="0.5"/>
+    <material name="drone6_mat" rgba="1.00 0.25 0.25 0.9" specular="0.5"/>
+    <material name="drone7_mat" rgba="0.70 0.40 1.00 0.9" specular="0.5"/>
+  </asset>
+
+  <!-- ─── Defaults: joint & actuator limits ─────────────────────────── -->
+  <default>
+    <joint damping="0.01" armature="0.001"/>
+    <geom condim="3" friction="0.8 0.02 0.01"/>
+
+    <!-- Rotor spin joints (free to rotate, no limits) -->
+    <default class="rotor_joint">
+      <joint type="hinge" axis="0 0 1" damping="1e-6" armature="1e-7"/>
+    </default>
+
+    <!-- Propeller geometry — thin disc approximation -->
+    <default class="prop_geom">
+      <geom type="cylinder" size="0.023 0.002" material="prop_mat"
+            contype="0" conaffinity="0"/>
+    </default>
+
+    <!-- Arm geom — thin capsule -->
+    <default class="arm_geom">
+      <geom type="capsule" size="0.005" material="arm_mat"
+            contype="0" conaffinity="0"/>
+    </default>
+  </default>
+
+  <!-- ─── World body ─────────────────────────────────────────────────── -->
+  <worldbody>
+
+    <!-- Lighting -->
+    <light name="ceiling_main" pos="5 5 2.9" dir="0 0 -1"
+           diffuse="0.85 0.85 0.80" specular="0.3 0.3 0.3" castshadow="true"/>
+    <light name="ceiling_fill" pos="2 8 2.9" dir="0 0 -1"
+           diffuse="0.4 0.4 0.38" specular="0.1 0.1 0.1" castshadow="false"/>
+
+    <!-- Floor (10×10 m tile) -->
+    <geom name="floor" type="plane"
+          pos="5 5 0" size="5 5 0.1"
+          material="floor_mat" condim="3"/>
+
+    <!-- Walls: N, S, E, W (thin boxes, 3 m tall) -->
+    <geom name="wall_n" type="box"
+          pos="5 10 1.5" size="5 0.05 1.5" material="wall_mat" conaffinity="1"/>
+    <geom name="wall_s" type="box"
+          pos="5 0  1.5" size="5 0.05 1.5" material="wall_mat" conaffinity="1"/>
+    <geom name="wall_e" type="box"
+          pos="10 5 1.5" size="0.05 5 1.5" material="wall_mat" conaffinity="1"/>
+    <geom name="wall_w" type="box"
+          pos="0  5 1.5" size="0.05 5 1.5" material="wall_mat" conaffinity="1"/>
+    <!-- Ceiling -->
+    <geom name="ceiling" type="box"
+          pos="5 5 3.0" size="5 5 0.05" material="wall_mat" conaffinity="1"/>
+
+    <!-- ── Plant pot 0 — pos (2.0, 3.0) ─────────────────────────── -->
+    <body name="plant_pot_0" pos="2.0 3.0 0.0">
+      <!-- Terracotta pot body -->
+      <geom name="pot0_body" type="cylinder" size="0.17 0.225"
+            pos="0 0 0.225" material="terracotta" mass="0.5"/>
+      <!-- Soil surface -->
+      <geom name="pot0_soil" type="cylinder" size="0.16 0.01"
+            pos="0 0 0.46" material="soil" contype="0" conaffinity="0"/>
+      <!-- Foliage — layered spheres for a bushy look -->
+      <geom name="pot0_foliage0" type="sphere" size="0.28"
+            pos="0 0 0.78" material="foliage" contype="0" conaffinity="0"/>
+      <geom name="pot0_foliage1" type="sphere" size="0.20"
+            pos="0.15 0.10 0.95" material="foliage" contype="0" conaffinity="0"/>
+      <geom name="pot0_foliage2" type="sphere" size="0.18"
+            pos="-0.12 -0.08 0.92" material="foliage" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- ── Plant pot 1 — pos (7.0, 1.5) ─────────────────────────── -->
+    <body name="plant_pot_1" pos="7.0 1.5 0.0">
+      <geom name="pot1_body" type="cylinder" size="0.17 0.225"
+            pos="0 0 0.225" material="terracotta" mass="0.5"/>
+      <geom name="pot1_soil" type="cylinder" size="0.16 0.01"
+            pos="0 0 0.46" material="soil" contype="0" conaffinity="0"/>
+      <geom name="pot1_foliage0" type="sphere" size="0.30"
+            pos="0 0 0.80" material="foliage" contype="0" conaffinity="0"/>
+      <geom name="pot1_foliage1" type="sphere" size="0.18"
+            pos="-0.17 0.12 0.98" material="foliage" contype="0" conaffinity="0"/>
+      <geom name="pot1_foliage2" type="sphere" size="0.22"
+            pos="0.10 -0.15 0.95" material="foliage" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- ── Plant pot 2 — pos (3.0, 7.0) ─────────────────────────── -->
+    <body name="plant_pot_2" pos="3.0 7.0 0.0">
+      <geom name="pot2_body" type="cylinder" size="0.17 0.225"
+            pos="0 0 0.225" material="terracotta" mass="0.5"/>
+      <geom name="pot2_soil" type="cylinder" size="0.16 0.01"
+            pos="0 0 0.46" material="soil" contype="0" conaffinity="0"/>
+      <geom name="pot2_foliage0" type="sphere" size="0.26"
+            pos="0 0 0.75" material="foliage" contype="0" conaffinity="0"/>
+      <geom name="pot2_foliage1" type="sphere" size="0.19"
+            pos="0.13 -0.11 0.93" material="foliage" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- ── Floor zone 0 — sweep area (5.0, 5.0) ─────────────────── -->
+    <geom name="floor_zone_0" type="box"
+          pos="5.0 5.0 0.01" size="1.5 1.5 0.01"
+          material="zone_mat" contype="0" conaffinity="0"/>
+
+    <!-- ── Floor zone 1 — sweep area (2.0, 8.0) ─────────────────── -->
+    <geom name="floor_zone_1" type="box"
+          pos="2.0 8.0 0.01" size="1.5 1.5 0.01"
+          material="zone_mat" contype="0" conaffinity="0"/>
+
+    <!-- ── Light switch 0 — north wall (9.0, 0.5) at 2.0 m height ─ -->
+    <body name="light_switch_0" pos="9.9 0.5 1.5">
+      <!-- Back plate mounted flush on east wall (faces -x) -->
+      <geom name="ls0_plate"  type="box" size="0.05 0.15 0.20"
+            material="switch_plate" mass="0.15"/>
+      <geom name="ls0_paddle" type="box" size="0.03 0.08 0.14"
+            pos="-0.05 0.0 0.0" material="switch_paddle"
+            contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- ── Light switch 1 — west wall (0.5, 9.0) at 2.0 m height ── -->
+    <body name="light_switch_1" pos="0.1 9.0 1.5">
+      <geom name="ls1_plate"  type="box" size="0.05 0.15 0.20"
+            material="switch_plate" mass="0.15"/>
+      <geom name="ls1_paddle" type="box" size="0.03 0.08 0.14"
+            pos="0.05 0.0 0.0" material="switch_paddle"
+            contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- ══════════════════════════════════════════════════════════════
+         DRONE TEMPLATE — drone_0
+         Crazyflie 2.x-scale quadrotor
+           Body:     38 mm × 38 mm × 12 mm box, mass=27g
+           Motors:   4 × brushless (2.0g each) at arm tips
+           Arm span: 92 mm diagonal (46 mm arm length from centre)
+           Rotor diameter: 46 mm (radius 23 mm)
+
+         Motor layout (top view, z-up, x-forward):
+               M1(CCW)   M0(CW)
+                 \       /
+                  body
+                 /       \
+               M3(CW)   M2(CCW)
+         M0 = front-right (+x+y), M1 = front-left (+x-y)
+         M2 = rear-right  (-x+y), M3 = rear-left  (-x-y)
+
+         Free joint gives 6-DOF flight.
+         Rotors are hinge joints (spin axis z) with actuators producing
+         thrust (z-force) and reaction torque (z-torque).
+    ════════════════════════════════════════════════════════════════ -->
+
+    <body name="drone_0" pos="1.0 1.0 0.3">
+      <freejoint name="drone_0_freejoint"/>
+
+      <!-- Central body box -->
+      <geom name="drone_0_body" type="box"
+            size="0.019 0.019 0.006"
+            material="drone0_mat" mass="0.020"
+            condim="3"/>
+
+      <!-- Battery slab (bottom, heavier — lowers CoM for stability) -->
+      <geom name="drone_0_batt" type="box"
+            size="0.016 0.012 0.004" pos="0 0 -0.007"
+            rgba="0.1 0.1 0.4 1.0" mass="0.007"
+            contype="0" conaffinity="0"/>
+
+      <!-- Arms (4 × diagonal capsule) -->
+      <geom class="arm_geom" name="drone_0_arm0"
+            fromto="0 0 0  0.0326  0.0326 0"/>
+      <geom class="arm_geom" name="drone_0_arm1"
+            fromto="0 0 0  0.0326 -0.0326 0"/>
+      <geom class="arm_geom" name="drone_0_arm2"
+            fromto="0 0 0 -0.0326  0.0326 0"/>
+      <geom class="arm_geom" name="drone_0_arm3"
+            fromto="0 0 0 -0.0326 -0.0326 0"/>
+
+      <!-- Motor mounts + rotors (each motor body has mass + inertia) -->
+      <!-- Motor 0 — front-right (+x+y), CW -->
+      <body name="drone_0_motor0" pos="0.0326 0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_0_rotor0" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_0_prop0" pos="0 0 0.004"/>
+      </body>
+      <!-- Motor 1 — front-left (+x-y), CCW -->
+      <body name="drone_0_motor1" pos="0.0326 -0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_0_rotor1" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_0_prop1" pos="0 0 0.004"/>
+      </body>
+      <!-- Motor 2 — rear-right (-x+y), CCW -->
+      <body name="drone_0_motor2" pos="-0.0326 0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_0_rotor2" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_0_prop2" pos="0 0 0.004"/>
+      </body>
+      <!-- Motor 3 — rear-left (-x-y), CW -->
+      <body name="drone_0_motor3" pos="-0.0326 -0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_0_rotor3" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_0_prop3" pos="0 0 0.004"/>
+      </body>
+
+      <!-- IMU site (used to read accelerometer / gyro in code) -->
+      <site name="drone_0_imu" pos="0 0 0" size="0.003"/>
+    </body>
+
+    <!-- Drones 1–2 are clones of drone_0 at different spawn positions.
+         The MujocoHomeEnv Python class instantiates additional drones by
+         loading this XML and then programmatically duplicating the
+         drone_0 subtree via mjcf or by using n_drones copies via
+         include + position offsets.  For up to 3 drones we define
+         all three here to keep the XML self-contained. -->
+
+    <body name="drone_1" pos="2.0 1.0 0.3">
+      <freejoint name="drone_1_freejoint"/>
+      <geom name="drone_1_body" type="box" size="0.019 0.019 0.006"
+            material="drone1_mat" mass="0.020" condim="3"/>
+      <geom name="drone_1_batt" type="box" size="0.016 0.012 0.004"
+            pos="0 0 -0.007" rgba="0.1 0.1 0.4 1.0" mass="0.007"
+            contype="0" conaffinity="0"/>
+      <geom class="arm_geom" name="drone_1_arm0"
+            fromto="0 0 0  0.0326  0.0326 0"/>
+      <geom class="arm_geom" name="drone_1_arm1"
+            fromto="0 0 0  0.0326 -0.0326 0"/>
+      <geom class="arm_geom" name="drone_1_arm2"
+            fromto="0 0 0 -0.0326  0.0326 0"/>
+      <geom class="arm_geom" name="drone_1_arm3"
+            fromto="0 0 0 -0.0326 -0.0326 0"/>
+      <body name="drone_1_motor0" pos="0.0326 0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_1_rotor0" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_1_prop0" pos="0 0 0.004"/>
+      </body>
+      <body name="drone_1_motor1" pos="0.0326 -0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_1_rotor1" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_1_prop1" pos="0 0 0.004"/>
+      </body>
+      <body name="drone_1_motor2" pos="-0.0326 0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_1_rotor2" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_1_prop2" pos="0 0 0.004"/>
+      </body>
+      <body name="drone_1_motor3" pos="-0.0326 -0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_1_rotor3" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_1_prop3" pos="0 0 0.004"/>
+      </body>
+      <site name="drone_1_imu" pos="0 0 0" size="0.003"/>
+    </body>
+
+    <body name="drone_2" pos="3.0 1.0 0.3">
+      <freejoint name="drone_2_freejoint"/>
+      <geom name="drone_2_body" type="box" size="0.019 0.019 0.006"
+            material="drone2_mat" mass="0.020" condim="3"/>
+      <geom name="drone_2_batt" type="box" size="0.016 0.012 0.004"
+            pos="0 0 -0.007" rgba="0.1 0.1 0.4 1.0" mass="0.007"
+            contype="0" conaffinity="0"/>
+      <geom class="arm_geom" name="drone_2_arm0"
+            fromto="0 0 0  0.0326  0.0326 0"/>
+      <geom class="arm_geom" name="drone_2_arm1"
+            fromto="0 0 0  0.0326 -0.0326 0"/>
+      <geom class="arm_geom" name="drone_2_arm2"
+            fromto="0 0 0 -0.0326  0.0326 0"/>
+      <geom class="arm_geom" name="drone_2_arm3"
+            fromto="0 0 0 -0.0326 -0.0326 0"/>
+      <body name="drone_2_motor0" pos="0.0326 0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_2_rotor0" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_2_prop0" pos="0 0 0.004"/>
+      </body>
+      <body name="drone_2_motor1" pos="0.0326 -0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_2_rotor1" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_2_prop1" pos="0 0 0.004"/>
+      </body>
+      <body name="drone_2_motor2" pos="-0.0326 0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_2_rotor2" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_2_prop2" pos="0 0 0.004"/>
+      </body>
+      <body name="drone_2_motor3" pos="-0.0326 -0.0326 0.004">
+        <geom type="cylinder" size="0.006 0.004" rgba="0.3 0.3 0.3 1.0"
+              mass="0.002" contype="0" conaffinity="0"/>
+        <joint name="drone_2_rotor3" class="rotor_joint"/>
+        <geom class="prop_geom" name="drone_2_prop3" pos="0 0 0.004"/>
+      </body>
+      <site name="drone_2_imu" pos="0 0 0" size="0.003"/>
+    </body>
+
+  </worldbody>
+
+  <!-- ─── Actuators ──────────────────────────────────────────────────
+       Each drone has 4 rotor actuators.  They are velocity actuators
+       on the spin joints — the real Crazyflie uses PWM→RPM control.
+       The Python layer converts the high-level (dx,dy,dz,tool) action
+       from the trained policy into per-rotor RPM commands via an
+       attitude PID, matching the same interface as HomeEnv.
+
+       kv = motor velocity gain   (~35,000 RPM / unit)
+       forcelimited = true: clamp each motor's output thrust
+  ──────────────────────────────────────────────────────────────────── -->
+  <actuator>
+    <!-- drone_0 -->
+    <velocity name="drone_0_m0" joint="drone_0_rotor0" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <velocity name="drone_0_m1" joint="drone_0_rotor1" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <velocity name="drone_0_m2" joint="drone_0_rotor2" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <velocity name="drone_0_m3" joint="drone_0_rotor3" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <!-- drone_1 -->
+    <velocity name="drone_1_m0" joint="drone_1_rotor0" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <velocity name="drone_1_m1" joint="drone_1_rotor1" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <velocity name="drone_1_m2" joint="drone_1_rotor2" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <velocity name="drone_1_m3" joint="drone_1_rotor3" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <!-- drone_2 -->
+    <velocity name="drone_2_m0" joint="drone_2_rotor0" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <velocity name="drone_2_m1" joint="drone_2_rotor1" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <velocity name="drone_2_m2" joint="drone_2_rotor2" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+    <velocity name="drone_2_m3" joint="drone_2_rotor3" kv="0.0001" forcelimited="true" forcerange="-0.010 0.015"/>
+  </actuator>
+
+  <!-- ─── Sensors ───────────────────────────────────────────────────
+       Accelerometer, gyroscope, and position tracker per drone.
+       Velocimeter gives clean world-frame velocity (= GPS-quality).
+       All are read in MujocoHomeEnv to build the 15-dim observation.
+  ──────────────────────────────────────────────────────────────────── -->
+  <sensor>
+    <!-- drone 0 -->
+    <accelerometer name="drone_0_acc"  site="drone_0_imu"/>
+    <gyro          name="drone_0_gyro" site="drone_0_imu"/>
+    <velocimeter   name="drone_0_vel"  site="drone_0_imu"/>
+    <framepos      name="drone_0_pos"  objtype="site" objname="drone_0_imu"/>
+    <!-- drone 1 -->
+    <accelerometer name="drone_1_acc"  site="drone_1_imu"/>
+    <gyro          name="drone_1_gyro" site="drone_1_imu"/>
+    <velocimeter   name="drone_1_vel"  site="drone_1_imu"/>
+    <framepos      name="drone_1_pos"  objtype="site" objname="drone_1_imu"/>
+    <!-- drone 2 -->
+    <accelerometer name="drone_2_acc"  site="drone_2_imu"/>
+    <gyro          name="drone_2_gyro" site="drone_2_imu"/>
+    <velocimeter   name="drone_2_vel"  site="drone_2_imu"/>
+    <framepos      name="drone_2_pos"  objtype="site" objname="drone_2_imu"/>
+  </sensor>
+
+</mujoco>
