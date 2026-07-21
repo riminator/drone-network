@@ -485,21 +485,29 @@ class MujocoHomeEnv(MultiAgentEnv):
             dist = float(np.linalg.norm(pos - task.spec.target_position))
 
             # Dense shaping: reward for getting closer to the task target.
-            # prev_dist stored per (agent, task) in self._prev_dist.
             key = (aid, task_idx)
             prev_dist = self._prev_dist.get(key, dist)
             delta = prev_dist - dist          # positive = got closer
             rewards[aid] += REWARD_PROXIMITY_SCALE * delta
             self._prev_dist[key] = dist
 
-            # tool_engaged: auto-engage when within range so the policy only
-            # needs to learn navigation, not a separate tool-toggle signal.
-            # action[3] is kept in the obs/action space for compatibility but
-            # proximity alone is sufficient to trigger task progress.
             if dist < _ENGAGE_DIST:
-                task.step(drone_position=pos, tool_engaged=True)
-                if task.completed:
-                    rewards[aid] += REWARD_TASK_COMPLETE
+                # Directly increment engage_steps_done using _ENGAGE_DIST as
+                # the tolerance, bypassing WaterPlantTask.is_at_target(tol=1.0).
+                # This lets the counter accumulate across multiple passes even
+                # if the drone oscillates within [0, _ENGAGE_DIST] rather than
+                # staying inside the tighter 1.0m is_at_target window.
+                if not hasattr(task, '_waypoints'):
+                    # WaterPlantTask / ToggleLightTask: directly advance counter
+                    task.engage_steps_done += 1
+                    if task.engage_steps_done >= task.spec.engage_steps_required:
+                        task.completed = True
+                        rewards[aid] += REWARD_TASK_COMPLETE
+                else:
+                    # SweepFloorTask: use its own waypoint logic
+                    task.step(drone_position=pos, tool_engaged=True)
+                    if task.completed:
+                        rewards[aid] += REWARD_TASK_COMPLETE
 
         tasks_done_after = sum(1 for t in self._tasks if t.completed)
         if tasks_done_after > tasks_done_before:
