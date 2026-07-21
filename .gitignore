@@ -38,3 +38,9 @@ results/
 # Temporary pybullet source build directories
 /tmp/pybullet_src/
 /tmp/pb_dl*/
+
+# Node (doc generation)
+node_modules/
+
+# Bob internal directory
+.bob/
