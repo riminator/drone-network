@@ -7,6 +7,17 @@ straight into RLlib's MAPPO trainer.
 
 Observation space per drone: Box(15,)   — see DroneAgent.get_observation
 Action space per drone:      Box(4,)    — (dx, dy, dz, tool_engage)
+
+Phase 1 additions
+-----------------
+* allocator   — optional BaseAllocator instance injected via config.
+                Defaults to _GreedyFallbackAllocator (old behaviour).
+* remove_task(task_id)   — vanish a task mid-episode; triggers re-allocation.
+* add_task(task_spec)    — inject a new task mid-episode; triggers re-allocation.
+* _apply_allocation()    — translates AllocationResult → _drone_task_map,
+                           respects co-assignment for shareable tasks.
+* step()                 — skips VANISHED tasks; calls task.step() for every
+                           drone assigned to a shared task.
 """
 
 from __future__ import annotations
@@ -21,12 +32,12 @@ from gymnasium import spaces
 try:
     from ray.rllib.env.multi_agent_env import MultiAgentEnv
 except ImportError:
-    # Fallback base class so the env can be imported without RLlib installed
     MultiAgentEnv = object  # type: ignore
 
 from envs.drone_agent import DroneAgent, MAX_BATTERY
 from envs.tasks import WaterPlantTask, SweepFloorTask, ToggleLightTask
-from envs.tasks.base_task import TaskSpec
+from envs.tasks.base_task import TaskSpec, TaskStatus
+from allocator.base_allocator import BaseAllocator, WorldSnapshot, AllocationResult, Bid
 
 # ---------------------------------------------------------------------------
 # Reward constants (also used by reward_shaping.py)
@@ -47,23 +58,69 @@ _TASK_REGISTRY = {
 }
 
 _DEFAULT_TASK_LAYOUTS = [
-    # (task_type, target_position, engage_steps)
-    ("water_plant",  [2.0, 3.0, 1.0], 10),
-    ("water_plant",  [7.0, 1.5, 1.0], 10),
-    ("sweep_floor",  [5.0, 5.0, 0.3], 15),
-    ("toggle_light", [9.0, 0.5, 2.5],  1),
-    ("toggle_light", [0.5, 9.0, 2.5],  1),
+    # (task_type, target_position, engage_steps, is_shareable)
+    ("water_plant",  [2.0, 3.0, 1.0], 10, False),
+    ("water_plant",  [7.0, 1.5, 1.0], 10, False),
+    ("sweep_floor",  [5.0, 5.0, 0.3], 15, True),   # sweep is co-assignable
+    ("toggle_light", [9.0, 0.5, 2.5],  1, False),
+    ("toggle_light", [0.5, 9.0, 2.5],  1, False),
 ]
 
 
-def _make_task(task_type: str, idx: int, target: list, engage_steps: int):
+def _make_task(task_type: str, idx: int, target: list, engage_steps: int,
+               is_shareable: bool = False):
     spec = TaskSpec(
         task_id=f"{task_type}_{idx}",
         task_type=task_type,
         target_position=np.array(target, dtype=np.float32),
         engage_steps_required=engage_steps,
+        is_shareable=is_shareable,
     )
     return _TASK_REGISTRY[task_type](spec)
+
+
+# ---------------------------------------------------------------------------
+# Built-in fallback allocator (greedy first-available — old behaviour)
+# ---------------------------------------------------------------------------
+
+class _GreedyFallbackAllocator(BaseAllocator):
+    """
+    Mimics the original _assign_tasks() logic so HomeEnv behaviour is
+    unchanged when no external allocator is provided.
+    Assigns each idle drone to the first unclaimed PENDING/ASSIGNED task.
+    """
+
+    def allocate(self, snapshot: WorldSnapshot) -> AllocationResult:
+        from envs.tasks.base_task import TaskStatus
+
+        # Tasks eligible for assignment (not done, not vanished)
+        active_statuses = {TaskStatus.PENDING, TaskStatus.ASSIGNED, TaskStatus.IN_PROGRESS}
+
+        # Build set of task indices already claimed by a non-idle drone
+        claimed: set[int] = set()
+        for task_idx in snapshot.current_assignments.values():
+            if task_idx is not None:
+                claimed.add(task_idx)
+
+        pending = [
+            i for i, t in enumerate(snapshot.tasks)
+            if t.status in active_statuses and i not in claimed
+        ]
+
+        assignments: dict[str, int | None] = {}
+        for drone_id in sorted(snapshot.drone_positions):
+            existing = snapshot.current_assignments.get(drone_id)
+            # Keep current assignment if still valid
+            if (existing is not None
+                    and existing < len(snapshot.tasks)
+                    and snapshot.tasks[existing].status in active_statuses):
+                assignments[drone_id] = existing
+            elif pending:
+                assignments[drone_id] = pending.pop(0)
+            else:
+                assignments[drone_id] = None
+
+        return AllocationResult(assignments=assignments)
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +132,14 @@ class HomeEnv(MultiAgentEnv):
     A simulated home room with n_drones cooperative agents.
 
     Episode ends when:
-      - All tasks are completed, OR
+      - All tasks are completed (or vanished), OR
       - max_steps is reached, OR
       - All drones are done (battery dead)
+
+    Phase 1 public API additions:
+      env.remove_task(task_id)            — vanish task mid-episode
+      env.add_task(task_spec_or_tuple)    — inject task mid-episode
+      env.allocator                       — pluggable BaseAllocator
     """
 
     metadata = {"render_modes": ["human", "rgb_array"]}
@@ -90,14 +152,13 @@ class HomeEnv(MultiAgentEnv):
         self.max_steps: int = config.get("max_steps", 500)
         self.task_layouts: list = config.get("task_layouts", _DEFAULT_TASK_LAYOUTS)
         self.render_mode: str | None = config.get("render_mode", None)
-        # Cooperative bonus: awarded if all tasks done before this fraction of
-        # max_steps has elapsed
         self.coop_time_threshold: float = config.get("coop_time_threshold", 0.7)
-        # Domain randomisation: Gaussian noise added to every observation during
-        # training so the policy learns to be robust to position uncertainty.
-        # Mimics the Crazyflie PID overshoot / sensor noise in PyBullet.
-        # Set to 0 to disable (default off for backward compat).
         self.obs_noise_std: float = config.get("obs_noise_std", 0.0)
+
+        # Pluggable allocator — defaults to the greedy fallback
+        self.allocator: BaseAllocator = config.get(
+            "allocator", _GreedyFallbackAllocator()
+        )
 
         self._room_bounds = np.array(self.room_size, dtype=np.float32)
 
@@ -150,13 +211,17 @@ class HomeEnv(MultiAgentEnv):
             drone.set_room_bounds(self._room_bounds)
             self._drones[agent_id] = drone
 
-        # Instantiate tasks
-        self._tasks = [
-            _make_task(t, i, pos, steps)
-            for i, (t, pos, steps) in enumerate(self.task_layouts)
-        ]
+        # Instantiate tasks — support both old 3-tuple and new 4-tuple layouts
+        self._tasks = []
+        for i, layout in enumerate(self.task_layouts):
+            if len(layout) == 4:
+                t, pos, steps, shareable = layout
+            else:
+                t, pos, steps = layout
+                shareable = False
+            self._tasks.append(_make_task(t, i, pos, steps, shareable))
 
-        # Initial task assignment (round-robin)
+        # Initial task assignment via allocator
         self._drone_task_map = {aid: None for aid in self._agent_ids}
         self._assign_tasks()
 
@@ -192,37 +257,61 @@ class HomeEnv(MultiAgentEnv):
                     rewards[agent_list[i].state.drone_id] += REWARD_COLLISION
                     rewards[agent_list[j].state.drone_id] += REWARD_COLLISION
 
-        # 3. Task progress
+        # 3. Task progress — handle VANISHED + co-assignment
+        realloc_needed = False
+
         for agent_id, drone in self._drones.items():
             task_idx = self._drone_task_map.get(agent_id)
             if task_idx is None:
                 continue
             task = self._tasks[task_idx]
-            if task.completed:
-                # Re-assign to next open task
+
+            # Drop reference to vanished or already-completed tasks
+            if task.status in (TaskStatus.VANISHED, TaskStatus.COMPLETE):
                 self._drone_task_map[agent_id] = None
-                self._assign_tasks()
+                realloc_needed = True
                 continue
 
+            # Step the task
             delta = task.step(drone.state.position, drone.state.tool_engaged)
             rewards[agent_id] += delta
+
+            # Update task status based on engagement
+            if (task.status == TaskStatus.ASSIGNED
+                    and task.is_at_target(drone.state.position)):
+                task.status = TaskStatus.IN_PROGRESS
+
+            # Update drone's local progress observation
             drone.state.task_progress = (
                 task.engage_steps_done / task.spec.engage_steps_required
             )
 
-            if task.completed:
-                rewards[agent_id] += task.completion_reward()
+            if task.status == TaskStatus.COMPLETE:
+                # Split the completion reward among all assigned drones
+                n_assigned = max(1, len(task.assigned_drone_ids))
+                rewards[agent_id] += task.completion_reward() / n_assigned
                 self._drone_task_map[agent_id] = None
-                self._assign_tasks()
+                self.allocator.on_task_complete(task_idx, self._step_count)
+                realloc_needed = True
 
-        # 4. Cooperative bonus
-        if all(t.completed for t in self._tasks):
+        if realloc_needed:
+            self._assign_tasks()
+
+        # 4. Cooperative bonus — all active tasks done
+        active_tasks = [
+            t for t in self._tasks
+            if t.status not in (TaskStatus.VANISHED,)
+        ]
+        if active_tasks and all(t.status == TaskStatus.COMPLETE for t in active_tasks):
             if self._step_count < self.max_steps * self.coop_time_threshold:
                 for aid in self._agent_ids:
                     rewards[aid] += REWARD_COOPERATIVE_BONUS
 
         # 5. Termination
-        all_tasks_done = all(t.completed for t in self._tasks)
+        all_tasks_done = all(
+            t.status in (TaskStatus.COMPLETE, TaskStatus.VANISHED)
+            for t in self._tasks
+        )
         all_drones_done = all(d.state.is_done for d in self._drones.values())
         time_limit = self._step_count >= self.max_steps
 
@@ -239,6 +328,46 @@ class HomeEnv(MultiAgentEnv):
         return obs, rewards, terminated, truncated, infos
 
     # ------------------------------------------------------------------
+    # Phase 1 disruption API
+    # ------------------------------------------------------------------
+
+    def remove_task(self, task_id: str) -> bool:
+        """
+        Vanish a task mid-episode (e.g. plant removed, light already off).
+        Returns True if found and vanished, False if not found or already done.
+        """
+        for i, task in enumerate(self._tasks):
+            if task.spec.task_id == task_id:
+                if task.status in (TaskStatus.COMPLETE, TaskStatus.VANISHED):
+                    return False
+                task.vanish()
+                self.allocator.on_task_vanish(i, self._step_count)
+                # Free drones that were assigned to this task
+                for aid, tidx in self._drone_task_map.items():
+                    if tidx == i:
+                        self._drone_task_map[aid] = None
+                self._assign_tasks()
+                return True
+        return False
+
+    def add_task(
+        self,
+        task_type: str,
+        target: list[float],
+        engage_steps: int = 10,
+        is_shareable: bool = False,
+    ) -> str:
+        """
+        Inject a new task mid-episode (e.g. a spill appears).
+        Returns the new task_id.
+        """
+        idx = len(self._tasks)
+        new_task = _make_task(task_type, idx, target, engage_steps, is_shareable)
+        self._tasks.append(new_task)
+        self._assign_tasks()
+        return new_task.spec.task_id
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -253,25 +382,64 @@ class HomeEnv(MultiAgentEnv):
         return positions
 
     def _assign_tasks(self):
-        """Assign unassigned drones to incomplete, unclaimed tasks."""
-        claimed = {
-            idx
-            for idx in self._drone_task_map.values()
-            if idx is not None
-        }
-        pending = [
-            i for i, t in enumerate(self._tasks)
-            if not t.completed and i not in claimed
-        ]
+        """
+        Ask the allocator for a new assignment and apply it.
+        Called at episode start and after any disruption event.
+        """
+        snapshot = WorldSnapshot(
+            drone_positions={
+                aid: d.state.position.copy()
+                for aid, d in self._drones.items()
+            },
+            drone_batteries={
+                aid: d.state.battery
+                for aid, d in self._drones.items()
+            },
+            drone_task_progress={
+                aid: d.state.task_progress
+                for aid, d in self._drones.items()
+            },
+            current_assignments=dict(self._drone_task_map),
+            tasks=self._tasks,
+            step=self._step_count,
+            max_steps=self.max_steps,
+        )
+        result = self.allocator.allocate(snapshot)
+        self._apply_allocation(result)
 
-        for agent_id in self._agent_ids:
-            if self._drone_task_map[agent_id] is None and pending:
-                task_idx = pending.pop(0)
-                self._drone_task_map[agent_id] = task_idx
-                self._tasks[task_idx].assigned_drone_id = agent_id
-                self._drones[agent_id].state.task_id = (
-                    self._tasks[task_idx].spec.task_id
-                )
+    def _apply_allocation(self, result: AllocationResult) -> None:
+        """
+        Write an AllocationResult into _drone_task_map and update
+        task.assigned_drone_ids to reflect the new assignment.
+        Handles co-assignment for shareable tasks.
+        """
+        # Clear all task assignee lists first
+        for task in self._tasks:
+            task.assigned_drone_ids = []
+
+        for agent_id, task_idx in result.assignments.items():
+            self._drone_task_map[agent_id] = task_idx
+            if task_idx is None:
+                self._drones[agent_id].state.task_id = None
+                continue
+
+            task = self._tasks[task_idx]
+
+            # Co-assignment: only allowed when task.spec.is_shareable
+            if agent_id not in task.assigned_drone_ids:
+                if task.spec.is_shareable or not task.assigned_drone_ids:
+                    task.assigned_drone_ids.append(agent_id)
+                else:
+                    # Non-shareable task already has an assignee — keep drone idle
+                    self._drone_task_map[agent_id] = None
+                    self._drones[agent_id].state.task_id = None
+                    continue
+
+            # Advance status from PENDING → ASSIGNED
+            if task.status == TaskStatus.PENDING:
+                task.status = TaskStatus.ASSIGNED
+
+            self._drones[agent_id].state.task_id = task.spec.task_id
 
     def _nearest_neighbour(self, agent_id: str) -> np.ndarray | None:
         """Return position of the closest other drone, or None."""
@@ -291,9 +459,12 @@ class HomeEnv(MultiAgentEnv):
         obs = {}
         for agent_id, drone in self._drones.items():
             task_idx = self._drone_task_map.get(agent_id)
+            task = self._tasks[task_idx] if task_idx is not None else None
             task_target = (
-                self._tasks[task_idx].spec.target_position
-                if task_idx is not None and not self._tasks[task_idx].completed
+                task.spec.target_position
+                if task is not None and task.status not in (
+                    TaskStatus.COMPLETE, TaskStatus.VANISHED
+                )
                 else None
             )
             neighbour = self._nearest_neighbour(agent_id)
@@ -304,11 +475,19 @@ class HomeEnv(MultiAgentEnv):
         return obs
 
     def _build_info_dict(self) -> dict[str, Any]:
-        tasks_completed = sum(1 for t in self._tasks if t.completed)
+        tasks_completed = sum(
+            1 for t in self._tasks if t.status == TaskStatus.COMPLETE
+        )
+        tasks_active = sum(
+            1 for t in self._tasks if t.status not in (
+                TaskStatus.COMPLETE, TaskStatus.VANISHED
+            )
+        )
         return {
             aid: {
                 "tasks_completed": tasks_completed,
                 "tasks_total": len(self._tasks),
+                "tasks_active": tasks_active,
                 "step": self._step_count,
                 "battery": self._drones[aid].state.battery,
             }
@@ -325,16 +504,15 @@ class HomeEnv(MultiAgentEnv):
         lines = [f"Step {self._step_count}/{self.max_steps}"]
         for aid, drone in self._drones.items():
             task_idx = self._drone_task_map.get(aid)
-            task_str = (
-                self._tasks[task_idx].spec.task_id
-                if task_idx is not None
-                else "idle"
-            )
+            if task_idx is not None:
+                task_str = self._tasks[task_idx].spec.task_id
+            else:
+                task_str = "idle"
             lines.append(
                 f"  {aid}: pos={drone.state.position.round(2)} "
                 f"batt={drone.state.battery:.1f} task={task_str}"
             )
-        tasks_done = sum(1 for t in self._tasks if t.completed)
+        tasks_done = sum(1 for t in self._tasks if t.status == TaskStatus.COMPLETE)
         lines.append(f"  Tasks: {tasks_done}/{len(self._tasks)} completed")
         output = "\n".join(lines)
         print(output)

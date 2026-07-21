@@ -41,6 +41,10 @@ class ToggleLightTask(BaseTask):
     def completion_reward(self) -> float:
         return self.COMPLETION_REWARD
 
+    def remaining_work(self) -> float:
+        """Binary — either done (0.0) or not started (1.0). Toggle is instantaneous."""
+        return 0.0 if self.completed else 1.0
+
     def reset(self):
         super().reset()
         self._prev_distance = None

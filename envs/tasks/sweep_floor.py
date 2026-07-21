@@ -69,6 +69,14 @@ class SweepFloorTask(BaseTask):
     def completion_reward(self) -> float:
         return self.COMPLETION_REWARD
 
+    def remaining_work(self) -> float:
+        """Fraction of waypoints still unvisited, normalised to [0, 1]."""
+        if self.completed:
+            return 0.0
+        n = len(self._waypoints)
+        done = min(self._current_wp_idx, n)
+        return 1.0 - done / n
+
     def reset(self):
         super().reset()
         self._current_wp_idx = 0

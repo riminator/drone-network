@@ -46,6 +46,13 @@ class WaterPlantTask(BaseTask):
     def completion_reward(self) -> float:
         return self.COMPLETION_REWARD
 
+    def remaining_work(self) -> float:
+        """Fraction of engage steps still needed, normalised to [0, 1]."""
+        if self.completed:
+            return 0.0
+        done = min(self.engage_steps_done, self.spec.engage_steps_required)
+        return 1.0 - done / self.spec.engage_steps_required
+
     def reset(self):
         super().reset()
         self._prev_distance = None
