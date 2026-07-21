@@ -73,12 +73,13 @@ _SCENE_XML   = str(_ASSETS_DIR / "scene.xml")
 # teleport-steps).  MuJoCo episodes are 600 real-physics steps, so we scale
 # the alive penalty down and add dense proximity shaping so the policy gets
 # useful gradient every step even before it ever completes a task.
-REWARD_STEP_ALIVE    = -0.002   # was -0.01; 600 steps × 3 drones = -3.6 total
-REWARD_COLLISION     = -0.5     # was -5.0; early training noise was drowning signal
-REWARD_BATTERY_DEAD  = -1.0     # was -3.0; softer — battery dying is already a problem
+REWARD_STEP_ALIVE    = -0.002   # 600 steps × 3 drones = -3.6 total baseline
+REWARD_COLLISION     = -0.5
+REWARD_BATTERY_DEAD  = -1.0
 REWARD_COOP_BONUS    = 2.0
-REWARD_PROXIMITY_SCALE = 0.5    # dense shaping: reward per metre of progress toward task
-REWARD_TASK_COMPLETE = 5.0      # sparse bonus per completed task (on top of engage steps)
+REWARD_PROXIMITY_SCALE = 0.1    # reduced: was ±0.5/m causing ±10-30/ep variance that
+                                 # drowns task-completion signal in the reward normalizer
+REWARD_TASK_COMPLETE = 20.0     # large sparse bonus so task completions clearly dominate
 
 # ---------------------------------------------------------------------------
 # Quadrotor physics constants
