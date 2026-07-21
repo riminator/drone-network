@@ -65,9 +65,9 @@ REWARD_COOP_BONUS   = 2.0
 # Keep z low: plant pots on floor, light switch on wall at 1.5m
 # ---------------------------------------------------------------------------
 _DEFAULT_TASK_LAYOUTS = [
-    ("water_plant",  [2.0, 3.0, 0.5], 10),
-    ("water_plant",  [7.0, 1.5, 0.5], 10),
-    ("sweep_floor",  [5.0, 5.0, 0.1], 15),
+    ("water_plant",  [2.0, 3.0, 1.0], 10),
+    ("water_plant",  [7.0, 1.5, 1.0], 10),
+    ("sweep_floor",  [5.0, 5.0, 1.0], 15),  # z=1.0: drone cruising altitude — no descent needed
     ("toggle_light", [9.0, 0.5, 1.5],  1),
     ("toggle_light", [0.5, 9.0, 1.5],  1),
 ]
@@ -80,10 +80,33 @@ _TASK_REGISTRY = {
 
 # URDF visual colours (r, g, b, a)
 _TASK_COLOURS = {
-    "water_plant":  [0.0, 0.6, 0.1, 1.0],  # green
-    "sweep_floor":  [0.7, 0.5, 0.1, 1.0],  # brown
-    "toggle_light": [1.0, 0.9, 0.0, 1.0],  # yellow
+    "water_plant":  [0.0, 0.7, 0.15, 1.0],  # green
+    "sweep_floor":  [0.8, 0.5, 0.1,  1.0],  # brown
+    "toggle_light": [1.0, 0.85, 0.0, 1.0],  # yellow
 }
+
+# Task short names shown in the floating label
+_TASK_LABELS = {
+    "water_plant":  "Water",
+    "sweep_floor":  "Sweep",
+    "toggle_light": "Light",
+}
+
+# Per-drone body colours — vivid, distinct, semi-transparent so the scene shows through
+_DRONE_COLOURS = [
+    [0.15, 0.65, 1.00, 0.85],   # 0  sky-blue
+    [1.00, 0.45, 0.05, 0.85],   # 1  orange
+    [0.20, 0.90, 0.35, 0.85],   # 2  lime
+    [0.90, 0.15, 0.80, 0.85],   # 3  magenta
+    [1.00, 0.95, 0.10, 0.85],   # 4  yellow
+    [0.10, 0.85, 0.90, 0.85],   # 5  cyan
+    [1.00, 0.25, 0.25, 0.85],   # 6  red
+    [0.70, 0.40, 1.00, 0.85],   # 7  violet
+]
+
+# Disc radius (m) used for the visual-only drone body overlay.
+# Sized for a 10×10 m room — large enough to see at a glance.
+_DRONE_VISUAL_RADIUS = 0.45
 
 
 def _make_task(task_type: str, idx: int, target: list, engage_steps: int):
@@ -158,6 +181,22 @@ class PybulletHomeEnv(MultiAgentEnv):
         self._debug_drone_labels: dict[str, int] = {}  # aid → debug text item id
         self._debug_task_lines: dict[str, int] = {}    # aid → debug line item id
         self._debug_hud_id: int = -1                    # single HUD text item
+        self._debug_key_hint_id: int = -1               # key-bindings reminder text
+
+        # Visual-override shape IDs — large coloured discs that replace the tiny
+        # Crazyflie mesh so drones are visible at room scale.  Rebuilt after each
+        # reset() because p.resetSimulation() wipes all visual shape registrations.
+        self._drone_visual_shape_ids: list[int] = []    # one per drone
+
+        # ── Camera state (GUI only) ───────────────────────────────────────────
+        # These are updated each step by _handle_camera_keys() so keyboard/mouse
+        # controls work without touching PyBullet's native mouse orbit.
+        cx, cy = self.room_size[0] / 2, self.room_size[1] / 2
+        self._cam_dist:   float = 13.0
+        self._cam_yaw:    float = 30.0
+        self._cam_pitch:  float = -40.0
+        self._cam_target: list  = [cx, cy, 1.0]
+        self._follow_drone_idx: int = -1   # -1 = free camera, 0–N = follow drone N
 
         # Create the aviary ONCE — opens the OS window a single time.
         # Each episode calls aviary.reset() which calls p.resetSimulation()
@@ -171,8 +210,18 @@ class PybulletHomeEnv(MultiAgentEnv):
             record=self.record,
             pyb_freq=240,
             ctrl_freq=48,
-            user_debug_gui=self.gui,
+            user_debug_gui=False,  # disable RPM sliders — they get wiped by
+                                   # p.resetSimulation() on every reset() but are
+                                   # never re-created, causing "Failed to read
+                                   # parameter" crashes from episode 2 onward.
+                                   # Our env adds its own debug overlays instead.
         )
+
+        # VelocityAviary hard-codes SPEED_LIMIT = 0.03 × MAX_SPEED_KMH = 0.25 m/s.
+        # 20% of max (1.67 m/s) is the sweet spot: fast enough to reach all targets
+        # within 800 steps, slow enough that the Crazyflie PID maintains altitude
+        # without the roll-induced descent that causes floor crashes at higher speeds.
+        self._aviary.SPEED_LIMIT = 0.20 * self._aviary.MAX_SPEED_KMH * (1000 / 3600)
 
         # Camera is set after aviary.__init__ finishes its own GUI setup
         if self.gui:
@@ -183,20 +232,107 @@ class PybulletHomeEnv(MultiAgentEnv):
     # ------------------------------------------------------------------
 
     def _set_camera(self):
-        """Point the camera at the room centre from a useful angle."""
+        """Apply current camera state to the PyBullet visualiser and configure display."""
         client = self._aviary.getPyBulletClient()
-        cx = self.room_size[0] / 2
-        cy = self.room_size[1] / 2
         p.resetDebugVisualizerCamera(
-            cameraDistance=8,
-            cameraYaw=30,
-            cameraPitch=-35,
-            cameraTargetPosition=[cx, cy, 0.8],
+            cameraDistance=self._cam_dist,
+            cameraYaw=self._cam_yaw,
+            cameraPitch=self._cam_pitch,
+            cameraTargetPosition=self._cam_target,
             physicsClientId=client,
         )
-        # Remove distracting default axes / grid overlays
-        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1, physicsClientId=client)
+        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS,           1, physicsClientId=client)
         p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0, physicsClientId=client)
+        p.configureDebugVisualizer(p.COV_ENABLE_MOUSE_PICKING,      1, physicsClientId=client)
+
+    # Preset camera views  (dist, yaw, pitch, target)
+    _CAM_PRESETS = [
+        (13.0,  30.0, -40.0, None),   # 1 — default isometric
+        (16.0,   0.0, -90.0, None),   # 2 — top-down
+        (14.0,   0.0, -20.0, None),   # 3 — north side
+        (14.0,  90.0, -20.0, None),   # 4 — west side
+        ( 8.0,  30.0, -15.0, None),   # 5 — low cinematic
+    ]
+
+    def _handle_camera_keys(self, real_positions: np.ndarray):
+        """
+        Read PyBullet keyboard events and update the camera each step.
+
+        Controls
+        ────────
+        W / S       — pan camera forward / back (along target point)
+        A / D       — pan camera left / right
+        Q / E       — zoom in / out
+        R / F       — tilt up / down (pitch)
+        Z / X       — rotate left / right (yaw)
+        1–5         — snap to preset view
+        0           — follow next drone (cycles through drones, then free)
+        """
+        client = self._aviary.getPyBulletClient()
+        keys = p.getKeyboardEvents(physicsClientId=client)
+
+        # Key codes
+        KEY_W = ord('w'); KEY_S = ord('s')
+        KEY_A = ord('a'); KEY_D = ord('d')
+        KEY_Q = ord('q'); KEY_E = ord('e')
+        KEY_R = ord('r'); KEY_F = ord('f')
+        KEY_Z = ord('z'); KEY_X = ord('x')
+        KEY_0 = ord('0')
+
+        PAN   = 0.15   # metres per step
+        ZOOM  = 0.25   # metres per step
+        ROT   = 1.5    # degrees per step
+        PITCH = 1.5    # degrees per step
+
+        pressed = lambda k: keys.get(k, 0) & p.KEY_IS_DOWN
+
+        # ── Follow-drone mode ─────────────────────────────────────────────
+        # Pressing 0 cycles: free → drone_0 → drone_1 → … → free
+        if keys.get(KEY_0, 0) & p.KEY_WAS_TRIGGERED:
+            self._follow_drone_idx = (self._follow_drone_idx + 1) % (self.n_drones + 1)
+            if self._follow_drone_idx == self.n_drones:
+                self._follow_drone_idx = -1  # back to free
+
+        if self._follow_drone_idx >= 0 and self._follow_drone_idx < len(real_positions):
+            # Lock target onto chosen drone, allow zoom/pitch while following
+            pos = real_positions[self._follow_drone_idx]
+            self._cam_target = [float(pos[0]), float(pos[1]), float(pos[2]) + 0.3]
+
+        # ── Preset views ──────────────────────────────────────────────────
+        cx, cy = self.room_size[0] / 2, self.room_size[1] / 2
+        for i, preset in enumerate(self._CAM_PRESETS):
+            if keys.get(ord(str(i + 1)), 0) & p.KEY_WAS_TRIGGERED:
+                self._cam_dist, self._cam_yaw, self._cam_pitch, _ = preset
+                self._cam_target = [cx, cy, 1.0]
+                self._follow_drone_idx = -1
+
+        # ── Free camera movement (skip if following a drone) ─────────────
+        if self._follow_drone_idx < 0:
+            # Pan: move target in the horizontal plane aligned with yaw
+            yaw_r = np.deg2rad(self._cam_yaw)
+            fwd   = np.array([ np.cos(yaw_r),  np.sin(yaw_r), 0.0])
+            right = np.array([-np.sin(yaw_r),  np.cos(yaw_r), 0.0])
+            if pressed(KEY_W): self._cam_target = (np.array(self._cam_target) + fwd   * PAN).tolist()
+            if pressed(KEY_S): self._cam_target = (np.array(self._cam_target) - fwd   * PAN).tolist()
+            if pressed(KEY_A): self._cam_target = (np.array(self._cam_target) - right * PAN).tolist()
+            if pressed(KEY_D): self._cam_target = (np.array(self._cam_target) + right * PAN).tolist()
+
+        # ── Zoom / rotate / pitch (always available) ──────────────────────
+        if pressed(KEY_Q): self._cam_dist  = max(1.0,   self._cam_dist  - ZOOM)
+        if pressed(KEY_E): self._cam_dist  = min(25.0,  self._cam_dist  + ZOOM)
+        if pressed(KEY_Z): self._cam_yaw  -= ROT
+        if pressed(KEY_X): self._cam_yaw  += ROT
+        if pressed(KEY_R): self._cam_pitch = min(-5.0,  self._cam_pitch + PITCH)
+        if pressed(KEY_F): self._cam_pitch = max(-89.0, self._cam_pitch - PITCH)
+
+        # Apply
+        p.resetDebugVisualizerCamera(
+            cameraDistance=self._cam_dist,
+            cameraYaw=self._cam_yaw,
+            cameraPitch=self._cam_pitch,
+            cameraTargetPosition=self._cam_target,
+            physicsClientId=client,
+        )
 
     def reset(
         self,
@@ -211,6 +347,14 @@ class PybulletHomeEnv(MultiAgentEnv):
         # and respawns drones at initial_xyzs with zeroed velocities/state.
         self._aviary.reset()
 
+        # p.resetSimulation() invalidates all debug item IDs — reset the caches
+        # so _update_debug_visuals creates fresh items instead of trying to
+        # replace items that no longer exist (which causes "User debug draw failed").
+        self._debug_drone_labels = {}
+        self._debug_task_lines   = {}
+        self._debug_hud_id       = -1
+        self._debug_key_hint_id  = -1
+
         # resetSimulation removed our scene objects — reload them
         self._task_object_ids = []
         self._tasks = [
@@ -222,6 +366,8 @@ class PybulletHomeEnv(MultiAgentEnv):
         # Re-apply camera (resetSimulation resets the debug visualiser too)
         if self.gui:
             self._set_camera()
+            # Rebuild drone visual overrides (wipes happen with resetSimulation)
+            self._apply_drone_visuals()
 
         self._step_count = 0
         self._drone_task_map = {aid: None for aid in self._agent_ids}
@@ -324,9 +470,40 @@ class PybulletHomeEnv(MultiAgentEnv):
         infos = self._build_info_dict()
 
         if self.gui:
+            self._handle_camera_keys(real_positions)
             self._update_debug_visuals(real_positions, agent_ids_sorted)
 
         return obs, rewards, terminated, truncated, infos
+
+    def _apply_drone_visuals(self):
+        """
+        Replace the tiny Crazyflie mesh on each drone body with a large coloured
+        flat disc so drones are clearly visible in a 10 m room.
+
+        Uses changeVisualShape(shapeIndex=…) which swaps the rendered geometry
+        without touching any physics body, mass, or inertia.  Must be called after
+        every aviary.reset() because p.resetSimulation() wipes the shape registry.
+        """
+        client = self._aviary.getPyBulletClient()
+        drone_ids = self._aviary.getDroneIds()
+        self._drone_visual_shape_ids = []
+
+        for i in range(self.n_drones):
+            colour = _DRONE_COLOURS[i % len(_DRONE_COLOURS)]
+            # Flat horizontal disc — visually obvious from above/side
+            vs = p.createVisualShape(
+                p.GEOM_CYLINDER,
+                radius=_DRONE_VISUAL_RADIUS,
+                length=0.06,
+                rgbaColor=colour,
+                physicsClientId=client,
+            )
+            p.changeVisualShape(
+                drone_ids[i], -1,
+                shapeIndex=vs,
+                physicsClientId=client,
+            )
+            self._drone_visual_shape_ids.append(vs)
 
     def _update_debug_visuals(
         self,
@@ -339,24 +516,39 @@ class PybulletHomeEnv(MultiAgentEnv):
         # ── Per-drone floating label ──────────────────────────────────────────
         for i, aid in enumerate(agent_ids_sorted):
             pos = real_positions[i].tolist()
-            label_pos = [pos[0], pos[1], pos[2] + 0.25]
+            label_pos = [pos[0], pos[1], pos[2] + 0.55]
 
             task_idx = self._drone_task_map.get(aid)
+            drone_colour = _DRONE_COLOURS[i % len(_DRONE_COLOURS)][:3]
+
             if task_idx is not None and not self._tasks[task_idx].completed:
-                prog = (
-                    self._tasks[task_idx].engage_steps_done
-                    / self._tasks[task_idx].spec.engage_steps_required
-                )
-                label = f"{aid}  {prog*100:.0f}%"
+                task      = self._tasks[task_idx]
+                task_type = task.spec.task_type
+                task_name = _TASK_LABELS.get(task_type, task_type)
+
+                if isinstance(task, SweepFloorTask):
+                    filled = task._current_wp_idx
+                    total  = len(task._waypoints)
+                else:
+                    filled = task.engage_steps_done
+                    total  = task.spec.engage_steps_required
+
+                # Unicode block progress bar: e.g. "████░░░░  4/10"
+                bar_width = 8
+                n_filled  = round(filled / max(total, 1) * bar_width)
+                bar       = "\u2588" * n_filled + "\u2591" * (bar_width - n_filled)
+                label     = f"Drone {i}  {task_name}\n{bar}  {filled}/{total}"
+                text_colour = _TASK_COLOURS[task_type][:3]
             else:
-                label = f"{aid}  idle"
+                label       = f"Drone {i}  IDLE"
+                text_colour = drone_colour
 
             prev = self._debug_drone_labels.get(aid, -1)
             item_id = p.addUserDebugText(
                 label,
                 label_pos,
-                textColorRGB=[0.2, 0.8, 1.0],
-                textSize=1.2,
+                textColorRGB=text_colour,
+                textSize=1.6,
                 replaceItemUniqueId=prev if prev != -1 else -1,
                 physicsClientId=client,
             )
@@ -368,36 +560,60 @@ class PybulletHomeEnv(MultiAgentEnv):
             prev_line = self._debug_task_lines.get(aid, -1)
 
             if task_idx is not None and not self._tasks[task_idx].completed:
-                target = self._tasks[task_idx].spec.target_position.tolist()
-                drone_pos = real_positions[i].tolist()
-                colour = _TASK_COLOURS.get(
-                    self._tasks[task_idx].spec.task_type, [1.0, 1.0, 1.0]
-                )[:3]
+                task      = self._tasks[task_idx]
+                task_type = task.spec.task_type
+                # For sweep, point to the active waypoint not the zone centre
+                if isinstance(task, SweepFloorTask):
+                    target = task.current_target.tolist()
+                else:
+                    target = task.spec.target_position.tolist()
+                drone_pos   = real_positions[i].tolist()
+                line_colour = _TASK_COLOURS[task_type][:3]
                 item_id = p.addUserDebugLine(
                     drone_pos, target,
-                    lineColorRGB=colour,
-                    lineWidth=1.5,
+                    lineColorRGB=line_colour,
+                    lineWidth=3.0,
                     replaceItemUniqueId=prev_line if prev_line != -1 else -1,
                     physicsClientId=client,
                 )
                 self._debug_task_lines[aid] = item_id
             elif prev_line != -1:
-                # Task done — remove the line
                 p.removeUserDebugItem(prev_line, physicsClientId=client)
                 self._debug_task_lines[aid] = -1
 
-        # ── HUD: step counter + task summary ─────────────────────────────────
-        done_count = sum(1 for t in self._tasks if t.completed)
+        # ── HUD: step + task summary ──────────────────────────────────────────
+        done_count  = sum(1 for t in self._tasks if t.completed)
+        total_tasks = len(self._tasks)
+        bar_str = "\u2588" * done_count + "\u2591" * (total_tasks - done_count)
+        follow_str = (
+            f"  |  Cam: drone_{self._follow_drone_idx}"
+            if self._follow_drone_idx >= 0
+            else ""
+        )
         hud = (
-            f"Step {self._step_count}/{self.max_steps}   "
-            f"Tasks {done_count}/{len(self._tasks)}"
+            f"Step {self._step_count:4d} / {self.max_steps}{follow_str}\n"
+            f"Tasks  {bar_str}  {done_count}/{total_tasks}"
         )
         self._debug_hud_id = p.addUserDebugText(
             hud,
-            [0.3, 0.3, 2.8],
-            textColorRGB=[1.0, 1.0, 0.3],
-            textSize=1.5,
+            [0.2, 0.2, 2.85],
+            textColorRGB=[1.0, 1.0, 0.2],
+            textSize=2.0,
             replaceItemUniqueId=self._debug_hud_id if self._debug_hud_id != -1 else -1,
+            physicsClientId=client,
+        )
+
+        # ── Key-bindings hint (bottom-left corner, small) ─────────────────────
+        hint = (
+            "WASD pan  Q/E zoom  Z/X rotate  R/F pitch\n"
+            "1-5 preset views  0 follow drone  mouse drag orbits"
+        )
+        self._debug_key_hint_id = p.addUserDebugText(
+            hint,
+            [0.2, 0.2, 0.08],
+            textColorRGB=[0.7, 0.7, 0.7],
+            textSize=0.9,
+            replaceItemUniqueId=self._debug_key_hint_id if self._debug_key_hint_id != -1 else -1,
             physicsClientId=client,
         )
 
@@ -433,7 +649,11 @@ class PybulletHomeEnv(MultiAgentEnv):
         client = self._aviary.getPyBulletClient()
 
         # Floor plane is already loaded by VelocityAviary.
-        # Load room walls as thin boxes.
+        # Overlay a coloured floor tile so the room looks like a real interior.
+        self._load_floor_tile(client)
+        # Ceiling
+        self._load_ceiling(client)
+        # Room walls as thin boxes
         self._load_walls(client)
 
         urdf_map = {
@@ -464,6 +684,40 @@ class PybulletHomeEnv(MultiAgentEnv):
 
             self._task_object_ids.append(body_id)
 
+    def _load_floor_tile(self, client: int):
+        """Warm cream floor tile overlaid on PyBullet's grey plane."""
+        w, d = self.room_size[0], self.room_size[1]
+        vis_id = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[w / 2, d / 2, 0.005],
+            rgbaColor=[0.92, 0.88, 0.78, 1.0],   # warm cream
+            physicsClientId=client,
+        )
+        p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=vis_id,
+            basePosition=[w / 2, d / 2, 0.005],
+            physicsClientId=client,
+        )
+
+    def _load_ceiling(self, client: int):
+        """Translucent white ceiling so the room feels enclosed."""
+        w, d, h = self.room_size
+        vis_id = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[w / 2, d / 2, 0.02],
+            rgbaColor=[1.0, 1.0, 1.0, 0.25],   # translucent white
+            physicsClientId=client,
+        )
+        p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=vis_id,
+            basePosition=[w / 2, d / 2, h],
+            physicsClientId=client,
+        )
+
     def _load_walls(self, client: int):
         """Load 4 thin box walls around the room perimeter."""
         w, d, h = self.room_size
@@ -481,7 +735,7 @@ class PybulletHomeEnv(MultiAgentEnv):
             )
             vis_id = p.createVisualShape(
                 p.GEOM_BOX, halfExtents=half_ext,
-                rgbaColor=[0.75, 0.85, 1.0, 0.55],   # light-blue tint, more opaque
+                rgbaColor=[0.90, 0.88, 0.84, 0.70],   # warm off-white plaster
                 physicsClientId=client,
             )
             p.createMultiBody(
@@ -533,11 +787,25 @@ class PybulletHomeEnv(MultiAgentEnv):
 
         for i, aid in enumerate(agent_ids_sorted):
             task_idx = self._drone_task_map.get(aid)
-            task_target = (
-                self._tasks[task_idx].spec.target_position
-                if task_idx is not None and not self._tasks[task_idx].completed
-                else None
-            )
+
+            # Use the task's *active* target — SweepFloorTask advances through
+            # waypoints, so current_target differs from spec.target_position.
+            task_target = None
+            task_progress = 0.0
+            if task_idx is not None and not self._tasks[task_idx].completed:
+                task = self._tasks[task_idx]
+                task_target = (
+                    task.current_target
+                    if isinstance(task, SweepFloorTask)
+                    else task.spec.target_position
+                )
+                # Progress: waypoint fraction for sweep, engage fraction for others
+                if isinstance(task, SweepFloorTask):
+                    task_progress = task._current_wp_idx / len(task._waypoints)
+                else:
+                    task_progress = (
+                        task.engage_steps_done / task.spec.engage_steps_required
+                    )
 
             # Find nearest neighbour position
             neighbour_pos = None
@@ -553,11 +821,6 @@ class PybulletHomeEnv(MultiAgentEnv):
             o = np.zeros(self.OBS_DIM, dtype=np.float32)
             o[0:3]  = real_positions[i]
             o[3]    = 1.0   # no battery model in pybullet env — always full
-            task_progress = (
-                self._tasks[task_idx].engage_steps_done
-                / self._tasks[task_idx].spec.engage_steps_required
-                if task_idx is not None else 0.0
-            )
             o[4]    = task_progress
             if task_target is not None:
                 o[5:8] = task_target - real_positions[i]

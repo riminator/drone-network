@@ -102,20 +102,31 @@ python -m evaluation.eval \
 ### 4. Deploy in PyBullet physics lab
 
 ```bash
-# Real-time, GUI open
+# Recommended — 6 drones, slow-motion so you can watch
 python -m lab.deploy \
-  --checkpoint checkpoints/actor_update100_final.pt
-
-# Slow-motion (easier to watch)
-python -m lab.deploy \
-  --checkpoint checkpoints/actor_update100_final.pt \
+  --checkpoint checkpoints/actor_update204_final.pt \
+  --n-drones 6 \
   --time-scale 0.3
 
-# Headless benchmark
+# Headless benchmark (fast)
 python -m lab.deploy \
-  --checkpoint checkpoints/actor_update100_final.pt \
-  --no-gui --episodes 50
+  --checkpoint checkpoints/actor_update204_final.pt \
+  --n-drones 6 \
+  --no-gui --episodes 20
 ```
+
+**Camera controls** (click the PyBullet window first):
+
+| Key | Action |
+|---|---|
+| `W` / `S` | Pan forward / back |
+| `A` / `D` | Pan left / right |
+| `Q` / `E` | Zoom in / out |
+| `Z` / `X` | Rotate left / right |
+| `R` / `F` | Tilt up / down |
+| `1`–`5` | Preset views (isometric / top-down / sides / cinematic) |
+| `0` | Cycle follow-drone (locks camera on each drone in turn) |
+| Mouse drag | Orbit (left), pan (right), scroll zoom |
 
 ---
 

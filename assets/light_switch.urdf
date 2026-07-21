@@ -10,7 +10,7 @@
     </inertial>
     <visual>
       <geometry>
-        <box size="0.08 0.04 0.12"/>
+        <box size="0.40 0.12 0.60"/>
       </geometry>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <material name="white">
@@ -19,7 +19,7 @@
     </visual>
     <collision>
       <geometry>
-        <box size="0.08 0.04 0.12"/>
+        <box size="0.40 0.12 0.60"/>
       </geometry>
     </collision>
   </link>
@@ -32,7 +32,7 @@
     </inertial>
     <visual>
       <geometry>
-        <box size="0.04 0.03 0.07"/>
+        <box size="0.20 0.10 0.35"/>
       </geometry>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <material name="yellow">
@@ -44,7 +44,7 @@
   <joint name="paddle_joint" type="fixed">
     <parent link="plate"/>
     <child link="paddle"/>
-    <origin xyz="0 0.035 0.02" rpy="0 0 0"/>
+    <origin xyz="0 0.115 0.10" rpy="0 0 0"/>
   </joint>
 
 </robot>

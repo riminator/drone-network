@@ -9,8 +9,8 @@
     </inertial>
     <visual>
       <geometry>
-        <!-- 2m × 2m zone, 2cm thick -->
-        <box size="2.0 2.0 0.02"/>
+        <!-- 3m × 3m zone, 4cm thick — large enough to see clearly in a 10 m room -->
+        <box size="3.0 3.0 0.04"/>
       </geometry>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <material name="dirt">

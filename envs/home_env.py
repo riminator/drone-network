@@ -93,6 +93,11 @@ class HomeEnv(MultiAgentEnv):
         # Cooperative bonus: awarded if all tasks done before this fraction of
         # max_steps has elapsed
         self.coop_time_threshold: float = config.get("coop_time_threshold", 0.7)
+        # Domain randomisation: Gaussian noise added to every observation during
+        # training so the policy learns to be robust to position uncertainty.
+        # Mimics the Crazyflie PID overshoot / sensor noise in PyBullet.
+        # Set to 0 to disable (default off for backward compat).
+        self.obs_noise_std: float = config.get("obs_noise_std", 0.0)
 
         self._room_bounds = np.array(self.room_size, dtype=np.float32)
 
@@ -292,7 +297,10 @@ class HomeEnv(MultiAgentEnv):
                 else None
             )
             neighbour = self._nearest_neighbour(agent_id)
-            obs[agent_id] = drone.get_observation(task_target, neighbour)
+            o = drone.get_observation(task_target, neighbour)
+            if self.obs_noise_std > 0.0:
+                o = o + np.random.normal(0.0, self.obs_noise_std, o.shape).astype(np.float32)
+            obs[agent_id] = o
         return obs
 
     def _build_info_dict(self) -> dict[str, Any]:

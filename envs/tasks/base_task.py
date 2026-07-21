@@ -57,7 +57,7 @@ class BaseTask(ABC):
     def distance_to_target(self, drone_position: np.ndarray) -> float:
         return float(np.linalg.norm(drone_position - self.spec.target_position))
 
-    def is_at_target(self, drone_position: np.ndarray, tolerance: float = 0.5) -> bool:
+    def is_at_target(self, drone_position: np.ndarray, tolerance: float = 1.0) -> bool:
         return self.distance_to_target(drone_position) <= tolerance
 
     def reset(self):

@@ -18,7 +18,7 @@ class SweepFloorTask(BaseTask):
     """
 
     COMPLETION_REWARD = 12.0
-    WAYPOINT_TOLERANCE = 0.6
+    WAYPOINT_TOLERANCE = 0.9
 
     def __init__(self, spec: TaskSpec, n_waypoints: int = 4):
         super().__init__(spec)

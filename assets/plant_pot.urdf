@@ -10,18 +10,18 @@
     </inertial>
     <visual>
       <geometry>
-        <cylinder radius="0.12" length="0.22"/>
+        <cylinder radius="0.35" length="0.55"/>
       </geometry>
-      <origin xyz="0 0 0.11" rpy="0 0 0"/>
+      <origin xyz="0 0 0.275" rpy="0 0 0"/>
       <material name="terracotta">
         <color rgba="0.72 0.40 0.20 1.0"/>
       </material>
     </visual>
     <collision>
       <geometry>
-        <cylinder radius="0.12" length="0.22"/>
+        <cylinder radius="0.35" length="0.55"/>
       </geometry>
-      <origin xyz="0 0 0.11" rpy="0 0 0"/>
+      <origin xyz="0 0 0.275" rpy="0 0 0"/>
     </collision>
   </link>
 
@@ -33,7 +33,7 @@
     </inertial>
     <visual>
       <geometry>
-        <sphere radius="0.18"/>
+        <sphere radius="0.45"/>
       </geometry>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <material name="green">
@@ -45,7 +45,7 @@
   <joint name="foliage_joint" type="fixed">
     <parent link="pot"/>
     <child link="foliage"/>
-    <origin xyz="0 0 0.38" rpy="0 0 0"/>
+    <origin xyz="0 0 0.90" rpy="0 0 0"/>
   </joint>
 
 </robot>

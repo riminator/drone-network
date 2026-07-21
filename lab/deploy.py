@@ -40,8 +40,26 @@ from models.actor import Actor
 
 def load_actor(checkpoint_path: str, obs_dim: int = 15, act_dim: int = 4) -> Actor:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = ckpt["actor_state_dict"]
+
+    # Detect checkpoints saved with the old architecture that had a learned
+    # log_std_head linear layer instead of the current log_std parameter.
+    # Those checkpoints are incompatible — abort with a clear message.
+    if "log_std_head.weight" in state and "log_std" not in state:
+        compatible = [
+            "actor_update100.pt", "actor_update200.pt",
+            "actor_update204_final.pt", "actor_update300.pt",
+        ]
+        raise RuntimeError(
+            f"\nCheckpoint '{checkpoint_path}' was saved with an older Actor "
+            f"architecture (log_std_head linear layer) that is incompatible "
+            f"with the current model.\n"
+            f"Use one of these compatible checkpoints instead:\n"
+            + "\n".join(f"  checkpoints/{c}" for c in compatible)
+        )
+
     actor = Actor(obs_dim=obs_dim, act_dim=act_dim)
-    actor.load_state_dict(ckpt["actor_state_dict"])
+    actor.load_state_dict(state)
     actor.eval()
     print(
         f"Loaded checkpoint: {checkpoint_path}\n"
@@ -183,8 +201,8 @@ if __name__ == "__main__":
                         help="Number of episodes to run (default: 5)")
     parser.add_argument("--n-drones",   type=int,   default=3,
                         help="Number of drones (default: 3)")
-    parser.add_argument("--max-steps",  type=int,   default=500,
-                        help="Max steps per episode (default: 500)")
+    parser.add_argument("--max-steps",  type=int,   default=800,
+                        help="Max steps per episode (default: 800)")
     parser.add_argument("--time-scale", type=float, default=1.0,
                         help="Playback speed: 1.0=real-time, 0.3=slow-mo, 0=max-speed")
     parser.add_argument("--no-gui",     action="store_true",
