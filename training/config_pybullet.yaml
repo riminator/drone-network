@@ -1,0 +1,53 @@
+# ============================================================
+# PyBullet physics training — trains policy directly in sim
+# Warm-starts from sim2real checkpoint via --resume flag
+# ============================================================
+
+env:
+  backend: "pybullet"         # use PybulletHomeEnv instead of HomeEnv
+  n_drones: 3
+  room_size: [10.0, 10.0, 3.0]
+  max_steps: 500
+  coop_time_threshold: 0.7
+  gui: false                  # headless — no window during training
+  record: false
+  auction_interval: 50        # re-auction every 50 steps
+  obs_noise_std: 0.05         # 5cm sensor noise
+  action_delay_steps: 1       # 1-step action latency
+  motor_lag: 0.2              # mild motor lag (less than deploy default)
+  domain_rand: true           # randomise mass/drag each episode
+
+model:
+  obs_dim: 15
+  act_dim: 4
+  actor_hidden: [256, 256]
+  critic_hidden: [512, 256]
+
+training:
+  total_timesteps: 1_500_000  # ~6 min at 4k steps/sec
+  rollout_steps: 1024         # shorter rollouts — episodes are longer in PyBullet
+  mini_batch_size: 128
+  n_epochs: 5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.005         # lower — policy already knows how to navigate
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  lr_actor: 5.0e-5            # fine-tune LR — don't destroy existing navigation
+  lr_critic: 5.0e-4
+  normalise_rewards: true
+  device: "auto"
+
+curriculum:
+  enabled: false
+
+logging:
+  log_interval: 5
+  eval_interval: 25
+  eval_episodes: 3
+  checkpoint_interval: 50
+  checkpoint_dir: "checkpoints_pybullet"
+  use_wandb: false
+  wandb_project: "drone-swarm"
+  wandb_entity: null

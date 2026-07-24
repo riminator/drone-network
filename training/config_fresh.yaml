@@ -1,0 +1,45 @@
+# ============================================================
+# Fresh training run — clean policy, safe checkpoint dir
+# ============================================================
+
+env:
+  n_drones: 3
+  room_size: [10.0, 10.0, 3.0]
+  max_steps: 500
+  coop_time_threshold: 0.7
+  obs_noise_std: 0.0        # no noise — learn clean navigation first
+
+model:
+  obs_dim: 15
+  act_dim: 4
+  actor_hidden: [256, 256]
+  critic_hidden: [512, 256]
+
+training:
+  total_timesteps: 3_000_000   # ~5 min at 10k steps/sec + PPO overhead
+  rollout_steps: 2048
+  mini_batch_size: 256
+  n_epochs: 5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.01           # higher entropy to encourage exploration early
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  lr_actor: 3.0e-4
+  lr_critic: 1.0e-3
+  normalise_rewards: true
+  device: "auto"
+
+curriculum:
+  enabled: false               # no curriculum — flat reward signal, easier to debug
+
+logging:
+  log_interval: 10
+  eval_interval: 50
+  eval_episodes: 5
+  checkpoint_interval: 100
+  checkpoint_dir: "checkpoints_fresh"   # isolated from old checkpoints
+  use_wandb: false
+  wandb_project: "drone-swarm"
+  wandb_entity: null

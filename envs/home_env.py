@@ -144,7 +144,7 @@ class HomeEnv(MultiAgentEnv):
 
     metadata = {"render_modes": ["human", "rgb_array"]}
 
-    def __init__(self, config: dict | None = None):
+    def __init__(self, config: dict | None = None):  # noqa: PLR0912
         config = config or {}
 
         self.n_drones: int = config.get("n_drones", 3)
@@ -154,6 +154,8 @@ class HomeEnv(MultiAgentEnv):
         self.render_mode: str | None = config.get("render_mode", None)
         self.coop_time_threshold: float = config.get("coop_time_threshold", 0.7)
         self.obs_noise_std: float = config.get("obs_noise_std", 0.0)
+        self.altitude_penalty_coef: float = config.get("altitude_penalty_coef", 0.0)
+        self.hover_z: float = config.get("hover_z", 1.0)
 
         # Pluggable allocator — defaults to the greedy fallback
         self.allocator: BaseAllocator = config.get(
@@ -248,6 +250,10 @@ class HomeEnv(MultiAgentEnv):
             drone.apply_action(action)
             if drone.state.battery <= 0.0:
                 rewards[agent_id] += REWARD_BATTERY_DEAD
+            # Altitude penalty: discourage flying below hover_z
+            if self.altitude_penalty_coef > 0.0:
+                drop = max(0.0, self.hover_z - drone.state.position[2])
+                rewards[agent_id] -= self.altitude_penalty_coef * drop
 
         # 2. Collision detection
         agent_list = list(self._drones.values())

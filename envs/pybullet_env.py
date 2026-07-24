@@ -101,10 +101,10 @@ REWARD_COOP_BONUS   = 2.0
 # ---------------------------------------------------------------------------
 _DEFAULT_TASK_LAYOUTS = [
     ("water_plant",  [2.0, 3.0, 1.0], 10),
-    ("water_plant",  [7.0, 1.5, 1.0], 10),
+    ("water_plant",  [7.0, 2.0, 1.0], 10),
     ("sweep_floor",  [5.0, 5.0, 1.0], 15),  # z=1.0: drone cruising altitude — no descent needed
-    ("toggle_light", [9.0, 0.5, 1.5],  1),
-    ("toggle_light", [0.5, 9.0, 1.5],  1),
+    ("toggle_light", [8.0, 2.0, 1.5],  1),  # moved inward from [9,0.5] — max traversal ~5m
+    ("toggle_light", [2.0, 8.0, 1.5],  1),  # moved inward from [0.5,9] — max traversal ~5m
 ]
 
 _TASK_REGISTRY = {
@@ -141,7 +141,7 @@ _DRONE_COLOURS = [
 
 # Disc radius (m) used for the visual-only drone body overlay.
 # Sized for a 10×10 m room — large enough to see at a glance.
-_DRONE_VISUAL_RADIUS = 0.45
+_DRONE_VISUAL_RADIUS = 0.8
 
 
 def _make_task(task_type: str, idx: int, target: list, engage_steps: int):
@@ -197,6 +197,19 @@ class PybulletHomeEnv(MultiAgentEnv):
         # Re-run the auction every this many steps (0 = only on task completion)
         self.auction_interval: int    = config.get("auction_interval", 0)
 
+        # ---- Sim-to-real fidelity parameters ----
+        # obs_noise_std: Gaussian noise (m) added to position/velocity obs.
+        #   Matches real-world UWB/OptiTrack localisation uncertainty (~0.05m).
+        self.obs_noise_std: float    = config.get("obs_noise_std", 0.05)
+        # action_delay_steps: number of ctrl steps the action is held before
+        #   being applied.  Real Crazyflie radio + compute latency ≈ 20–40ms = 1–2 steps.
+        self.action_delay_steps: int = config.get("action_delay_steps", 1)
+        # motor_lag: first-order low-pass coefficient on velocity commands (0=instant, 1=frozen).
+        #   Models motor spin-up/down lag (~30ms time constant on CF2.x).
+        self.motor_lag: float        = config.get("motor_lag", 0.3)
+        # domain_randomisation: if True, randomly perturb mass and drag each episode.
+        self.domain_rand: bool       = config.get("domain_rand", False)
+
         self._agent_ids = {f"drone_{i}" for i in range(self.n_drones)}
         if hasattr(super(), "__init__"):
             super().__init__()
@@ -217,6 +230,10 @@ class PybulletHomeEnv(MultiAgentEnv):
         self._tool_engaged: dict[str, bool] = {}
         self._task_object_ids: list[int] = []
         self._init_xyzs = self._get_init_positions()
+        # Sim2real: action delay FIFO — holds last `action_delay_steps` vel commands
+        self._action_queue: list = []
+        # Sim2real: smoothed velocity command per drone (motor lag low-pass filter)
+        self._smoothed_vel: np.ndarray = np.zeros((self.n_drones, 4), dtype=np.float32)
 
         # Debug overlay state (GUI only) — item IDs so we can move/replace them
         self._debug_drone_labels: dict[str, int] = {}  # aid → debug text item id
@@ -246,11 +263,15 @@ class PybulletHomeEnv(MultiAgentEnv):
         # Create the aviary ONCE — opens the OS window a single time.
         # Each episode calls aviary.reset() which calls p.resetSimulation()
         # internally, then we reload the lightweight scene objects.
+        # Physics.PYB_GND_DRAG_DW enables all three real-world effects:
+        #   GND  — ground effect: extra lift when prop wash reflects off floor
+        #   DRAG — aerodynamic drag proportional to velocity^2
+        #   DW   — downwash: upper drone's prop wash disturbs drones below it
         self._aviary = VelocityAviary(
             drone_model=DroneModel.CF2X,
             num_drones=self.n_drones,
             initial_xyzs=self._init_xyzs,
-            physics=Physics.PYB,
+            physics=Physics.PYB_GND_DRAG_DW,
             gui=self.gui,
             record=self.record,
             pyb_freq=240,
@@ -262,11 +283,9 @@ class PybulletHomeEnv(MultiAgentEnv):
                                    # Our env adds its own debug overlays instead.
         )
 
-        # VelocityAviary hard-codes SPEED_LIMIT = 0.03 × MAX_SPEED_KMH = 0.25 m/s.
-        # 20% of max (1.67 m/s) is the sweet spot: fast enough to reach all targets
-        # within 800 steps, slow enough that the Crazyflie PID maintains altitude
-        # without the roll-induced descent that causes floor crashes at higher speeds.
-        self._aviary.SPEED_LIMIT = 0.20 * self._aviary.MAX_SPEED_KMH * (1000 / 3600)
+        # Target cruise speed: 0.8 m/s — slow enough that PID maintains altitude
+        # during lateral movement (tilt angle stays <15° at this speed).
+        self._aviary.SPEED_LIMIT = 0.8
 
         # Camera is set after aviary.__init__ finishes its own GUI setup
         if self.gui:
@@ -419,6 +438,29 @@ class PybulletHomeEnv(MultiAgentEnv):
         self._step_count = 0
         self._drone_task_map = {aid: None for aid in self._agent_ids}
         self._tool_engaged   = {aid: False for aid in self._agent_ids}
+
+        # Reset sim2real state
+        zero_cmd = np.zeros((self.n_drones, 4), dtype=np.float32)
+        self._action_queue = [zero_cmd.copy() for _ in range(max(1, self.action_delay_steps))]
+        self._smoothed_vel = zero_cmd.copy()
+
+        # Domain randomisation: perturb mass and drag coefficients each episode
+        if self.domain_rand:
+            client = self._aviary.getPyBulletClient()
+            for i, drone_id in enumerate(self._aviary.getDroneIds()):
+                # ±10% mass jitter
+                mass_scale = np.random.uniform(0.90, 1.10)
+                dyn = p.getDynamicsInfo(drone_id, -1, physicsClientId=client)
+                p.changeDynamics(
+                    drone_id, -1,
+                    mass=dyn[0] * mass_scale,
+                    physicsClientId=client,
+                )
+            # ±20% drag jitter — scale the aviary's drag coefficients
+            drag_scale = np.random.uniform(0.80, 1.20)
+            self._aviary.DRAG_COEFF = getattr(self._aviary, 'DRAG_COEFF',
+                np.array([9.1785e-7, 9.1785e-7, 10.311e-7])) * drag_scale
+
         self._assign_tasks(self._aviary.pos)
 
         obs = self._build_obs_dict()
@@ -449,16 +491,33 @@ class PybulletHomeEnv(MultiAgentEnv):
         # Mapping: pass policy[:3] as the direction, use its magnitude as speed.
         # When the drone is moving toward a target, ||action[:3]|| ≈ 1 → full speed.
         # tool_engage is tracked separately and NOT passed as speed.
-        vel_cmds = np.zeros((self.n_drones, 4), dtype=np.float32)
+        raw_cmds = np.zeros((self.n_drones, 4), dtype=np.float32)
         for i, aid in enumerate(agent_ids_sorted):
             action = action_dict.get(aid, np.zeros(self.ACT_DIM))
             direction = action[:3].astype(np.float32)
             norm = float(np.linalg.norm(direction))
-            vel_cmds[i, :3] = direction                     # VelocityAviary normalises this internally
-            # Scale speed proportionally to action magnitude so gentle corrections
-            # don't snap to zero.  Dead-band is 0.01 to suppress pure noise.
-            vel_cmds[i, 3]  = float(np.clip(norm, 0.0, 1.0)) if norm > 0.01 else 0.0
+            raw_cmds[i, :3] = direction
+            raw_cmds[i, 3]  = float(np.clip(norm, 0.0, 1.0)) if norm > 0.01 else 0.0
             self._tool_engaged[aid] = float(action[3]) > 0.5
+
+        # --- Action delay: push new command, pop oldest for execution ---
+        self._action_queue.append(raw_cmds)
+        delayed_cmds = self._action_queue.pop(0)
+
+        # --- Motor lag: first-order low-pass on velocity commands ---
+        # smoothed = lag * smoothed + (1 - lag) * delayed
+        alpha = self.motor_lag
+        self._smoothed_vel = alpha * self._smoothed_vel + (1.0 - alpha) * delayed_cmds
+        vel_cmds = self._smoothed_vel.copy()
+
+        # --- Altitude floor: if a drone descends below MIN_HOVER_Z, zero its
+        #     downward velocity and inject an upward correction command instead.
+        #     This mirrors HomeEnv's z=0 clip and prevents floor-crash lockup. ---
+        MIN_HOVER_Z = 0.15
+        for i in range(self.n_drones):
+            if self._aviary.pos[i][2] < MIN_HOVER_Z:
+                vel_cmds[i, :3] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                vel_cmds[i, 3]  = 1.0   # full speed upward
 
         # --- Step the physics ---
         _obs_pb, _rew_pb, terminated_pb, truncated_pb, _info_pb = self._aviary.step(vel_cmds)
@@ -547,7 +606,7 @@ class PybulletHomeEnv(MultiAgentEnv):
             vs = p.createVisualShape(
                 p.GEOM_CYLINDER,
                 radius=_DRONE_VISUAL_RADIUS,
-                length=0.06,
+                length=0.25,
                 rgbaColor=colour,
                 physicsClientId=client,
             )
@@ -966,12 +1025,27 @@ class PybulletHomeEnv(MultiAgentEnv):
             o[0:3]  = real_positions[i]
             o[3]    = 1.0   # no battery model in pybullet env — always full
             o[4]    = task_progress
+
             if task_target is not None:
                 o[5:8] = task_target - real_positions[i]
+            else:
+                # No task assigned — point drone back to its spawn position so
+                # the policy steers it home instead of drifting upward.
+                o[5:8] = self._init_xyzs[i] - real_positions[i]
             o[8:11] = real_velocities[i]
             o[11]   = float(self._tool_engaged.get(aid, False))
             if neighbour_pos is not None:
                 o[12:15] = neighbour_pos - real_positions[i]
+
+            # Observation noise: inject Gaussian noise into continuous dims
+            # (pos, vel, task-vector, neighbour-vector) to match real-world
+            # UWB/OptiTrack localisation uncertainty.  Discrete slots (battery,
+            # progress, tool-engaged) are left clean.
+            if self.obs_noise_std > 0.0:
+                noise_dims = list(range(0, 3)) + list(range(5, 11)) + list(range(12, 15))
+                o[noise_dims] += np.random.normal(
+                    0.0, self.obs_noise_std, size=len(noise_dims)
+                ).astype(np.float32)
 
             obs[aid] = o
 

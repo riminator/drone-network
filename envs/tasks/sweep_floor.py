@@ -18,7 +18,7 @@ class SweepFloorTask(BaseTask):
     """
 
     COMPLETION_REWARD = 12.0
-    WAYPOINT_TOLERANCE = 0.9
+    WAYPOINT_TOLERANCE = 1.5
 
     def __init__(self, spec: TaskSpec, n_waypoints: int = 4):
         super().__init__(spec)
@@ -33,11 +33,14 @@ class SweepFloorTask(BaseTask):
         """Generate a back-and-forth sweep pattern around the centre."""
         waypoints = []
         half = (n - 1) * spacing / 2
+        # Clamp waypoint z to a safe hover altitude so drones don't descend
+        # into the floor when operating in physics simulators.
+        hover_z = max(centre[2], 1.0)
         for i in range(n):
             x_offset = -half + i * spacing
             waypoints.append(
                 np.array(
-                    [centre[0] + x_offset, centre[1], centre[2]],
+                    [centre[0] + x_offset, centre[1], hover_z],
                     dtype=np.float32,
                 )
             )

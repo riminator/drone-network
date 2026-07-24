@@ -102,10 +102,14 @@ drone-network/
 │   └── critic.py             Centralised value MLP (n_drones × 15 → scalar)
 │
 ├── training/
-│   ├── train_mappo.py        Phase 1: MAPPO loop — shared Actor + CentralCritic
+│   ├── train_mappo.py        Phase 1/6: MAPPO loop — shared Actor + CentralCritic
+│   │                           backend="pybullet" → trains directly in PybulletHomeEnv
 │   ├── train_bid_policy.py   Phase 3: BidPolicy PPO — frozen exec actor + BidValueNet
 │   ├── config.yaml           MAPPO hyperparameters + bid-policy section
-│   └── config_bid.yaml       Dedicated bid-policy config (7-task harder layout)
+│   ├── config_bid.yaml       Dedicated bid-policy config (7-task harder layout)
+│   ├── config_fresh.yaml     Phase 6: clean run, no curriculum, no obs noise
+│   ├── config_sim2real.yaml  Phase 6: obs noise + altitude penalty (HomeEnv)
+│   └── config_pybullet.yaml  Phase 6: fine-tune directly in PyBullet physics sim
 │
 ├── evaluation/
 │   ├── eval.py               Load checkpoint → benchmark episodes (execution eval)
@@ -126,7 +130,9 @@ drone-network/
 │   │                           LearnedBidder, obs_delay, marginal bids (35 tests)
 │   ├── test_phase4.py        EpisodeMetrics, realloc latency, scenario hooks,
 │   │                           _CountingAllocator, benchmark driver (52 tests)
-│   └── test_phase5.py        PybulletEnv allocator integration, bid lines (36 tests)
+│   ├── test_phase5.py        PybulletEnv allocator integration, bid lines (36 tests)
+│   └── test_phase6.py        Sim-to-real: altitude penalty, obs noise, action delay,
+│                               motor lag, domain rand, config validation (42 tests)
 │
 ├── utils/
 │   ├── replay_buffer.py      On-policy GAE rollout buffer (MAPPO)
@@ -139,8 +145,18 @@ drone-network/
 │
 ├── checkpoints/              (git-ignored — present locally)
 │   ├── actor_update204_final.pt    Best execution actor (5M steps)
+│   ├── actor_update580_final.pt    Latest execution actor (extended run)
 │   ├── bid_policy_final.pt         Best learned bidder (400 updates)
 │   └── bid_policy_update{50,100,...,400}.pt
+│
+├── checkpoints_fresh/        (git-ignored — Phase 6 clean run)
+│   └── actor_update{100,200,300,400,437_interrupted}.pt
+│
+├── checkpoints_sim2real/     (git-ignored — Phase 6 sim-to-real policy)
+│   └── actor_update{100,200,300,400,489_final}.pt
+│
+├── checkpoints_pybullet/     (git-ignored — Phase 6 PyBullet fine-tune)
+│   └── actor_update{50,100,...,489_final}.pt
 │
 └── results/                  (git-ignored — present locally)
     └── phase4_results.csv    20-episode benchmark (480 rows)
@@ -155,7 +171,7 @@ All commands run from the repo root. Checkpoints are in `checkpoints/` (git-igno
 ### 0 — Unit tests (run first, always)
 
 ```bash
-# Full suite — 176 tests, ~2 seconds
+# Full suite — 218 tests, ~2 seconds (PyBullet-only tests skipped if not installed)
 python3 -m pytest tests/ -v
 
 # Per-phase
@@ -164,6 +180,7 @@ python3 -m pytest tests/test_phase2.py -v   # GreedyAuction, CBBA
 python3 -m pytest tests/test_phase3.py -v   # BidPolicy dual-head, BidEnv, LearnedBidder
 python3 -m pytest tests/test_phase4.py -v   # eval harness, realloc latency metric
 python3 -m pytest tests/test_phase5.py -v   # PyBullet integration
+python3 -m pytest tests/test_phase6.py -v   # sim-to-real fidelity (Phase 6)
 
 # Specific feature groups
 python3 -m pytest tests/test_phase3.py -k "obs_delay" -v          # robustness parameter
@@ -173,7 +190,7 @@ python3 -m pytest tests/test_phase4.py -k "disruption" -v         # disruption h
 python3 -m pytest tests/ -k "shareable" -v                        # co-assignment
 ```
 
-Expected output: `176 passed`
+Expected output: `176 passed` (pure-Python tests) — PyBullet tests in `test_phase5.py` and `test_phase6.py` are skipped automatically when `gym-pybullet-drones` is not installed.
 
 ---
 
@@ -387,7 +404,70 @@ python3 -m training.train_bid_policy \
 
 ---
 
-### 6 — Programmatic usage examples
+### 6 — Sim-to-real training pipeline (Phase 6)
+
+Three configs are provided in a progressive fidelity ladder. Run them in order, each warm-starting from the previous phase's checkpoint.
+
+**Step A — clean baseline (`config_fresh.yaml`)**
+
+Train from scratch with no noise and no curriculum — used to establish a clean performance baseline:
+
+```bash
+python3 -m training.train_mappo --config training/config_fresh.yaml
+# Output: checkpoints_fresh/actor_update<N>_final.pt  (~3M steps, ~10 min CPU)
+```
+
+**Step B — sim-to-real hardening (`config_sim2real.yaml`)**
+
+Adds 5 cm observation noise and an altitude penalty to teach the policy to maintain z ≥ 1 m during lateral movement — critical for real quadrotor dynamics where low-speed PID struggles to hold altitude:
+
+```bash
+python3 -m training.train_mappo \
+    --config training/config_sim2real.yaml \
+    --resume checkpoints_fresh/actor_update<N>_final.pt
+# Output: checkpoints_sim2real/actor_update<N>_final.pt  (~3M steps, warm-start)
+```
+
+**Step C — PyBullet fine-tune (`config_pybullet.yaml`)**
+
+Fine-tune the hardened policy directly inside the physics simulator. Enables full aerodynamic effects (`PYB_GND_DRAG_DW`: ground effect, drag, downwash) plus action-delay FIFO, motor-lag low-pass filter, and per-episode domain randomisation (±10% mass, ±20% drag):
+
+```bash
+python3 -m training.train_mappo \
+    --config training/config_pybullet.yaml \
+    --resume checkpoints_sim2real/actor_update<N>_final.pt
+# Output: checkpoints_pybullet/actor_update<N>_final.pt  (~1.5M steps, ~6 min GPU)
+```
+
+**Sim-to-real parameters reference:**
+
+| Parameter | Config key | Default | Description |
+|---|---|---|---|
+| Obs noise | `obs_noise_std` | 0.05 m | Gaussian noise added to pos/vel obs (matches UWB/OptiTrack ~5 cm) |
+| Action delay | `action_delay_steps` | 1 step | FIFO holding old commands before execution (Crazyflie radio + compute latency) |
+| Motor lag | `motor_lag` | 0.3 | First-order low-pass α on velocity commands (motor spin-up/down, ~30 ms) |
+| Domain rand | `domain_rand` | false | ±10% mass jitter + ±20% drag jitter each episode |
+| Altitude penalty | `altitude_penalty_coef` | 0.0 | Penalty coefficient for flying below `hover_z` |
+| Hover altitude | `hover_z` | 1.0 m | Target hover height used by altitude penalty |
+| Physics mode | — (hardcoded) | `PYB_GND_DRAG_DW` | Ground effect + aerodynamic drag + downwash between drones |
+
+**Evaluate the PyBullet-fine-tuned policy:**
+
+```bash
+python3 -m evaluation.eval \
+    --checkpoint checkpoints_pybullet/actor_update489_final.pt \
+    --episodes 20
+
+# Or deploy visually in the PyBullet lab:
+python3 -m lab.deploy \
+    --checkpoint checkpoints_pybullet/actor_update489_final.pt \
+    --allocator greedy \
+    --time-scale 0.5
+```
+
+---
+
+### 7 — Programmatic usage examples
 
 ```python
 # Run one episode with any allocator

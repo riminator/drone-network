@@ -29,6 +29,7 @@ import torch.optim as optim
 import yaml
 
 from envs.home_env import HomeEnv
+from envs.pybullet_env import PybulletHomeEnv
 from models.actor import Actor
 from models.critic import CentralCritic
 from utils.replay_buffer import RolloutBuffer
@@ -203,7 +204,7 @@ def _save_checkpoint(
 # Main training loop
 # ---------------------------------------------------------------------------
 
-def train(cfg: dict):
+def train(cfg: dict, resume_checkpoint: str | None = None):
     # Auto-detect best available device.
     # Priority: CUDA (Nvidia, Windows/Linux/Colab) → CPU
     # MPS (Apple Silicon) is intentionally skipped — benchmarked at only 1.05× CPU
@@ -217,7 +218,11 @@ def train(cfg: dict):
     total_timesteps = cfg["training"]["total_timesteps"]
 
     # --- Environment ---
-    env = HomeEnv(config=cfg["env"])
+    backend = cfg["env"].get("backend", "abstract")
+    if backend == "pybullet":
+        env = PybulletHomeEnv(config=cfg["env"])
+    else:
+        env = HomeEnv(config=cfg["env"])
     obs_dict, _ = env.reset()
     agent_ids = sorted(env._agent_ids)
 
@@ -233,6 +238,14 @@ def train(cfg: dict):
         n_drones=n_drones,
         hidden_sizes=cfg["model"]["critic_hidden"],
     ).to(device)
+
+    # --- Resume from checkpoint if provided ---
+    if resume_checkpoint:
+        ckpt = torch.load(resume_checkpoint, map_location=device, weights_only=False)
+        actor.load_state_dict(ckpt["actor_state_dict"])
+        critic.load_state_dict(ckpt["critic_state_dict"])
+        print(f"[RESUME] Loaded weights from {resume_checkpoint} "
+              f"(update={ckpt.get('update','?')} ts={ckpt.get('timesteps','?'):,})\n")
 
     actor_optim = optim.Adam(actor.parameters(), lr=cfg["training"]["lr_actor"])
     critic_optim = optim.Adam(critic.parameters(), lr=cfg["training"]["lr_critic"])
@@ -435,6 +448,11 @@ if __name__ == "__main__":
         default="training/config.yaml",
         help="Path to YAML config file",
     )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to checkpoint .pt to warm-start weights from",
+    )
     args = parser.parse_args()
     cfg = load_config(args.config)
-    train(cfg)
+    train(cfg, resume_checkpoint=args.resume)
