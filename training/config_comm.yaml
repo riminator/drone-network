@@ -50,7 +50,7 @@ training:
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
-  entropy_coef: 0.005
+  entropy_coef: 0.01          # raised from 0.005 — CommActor has more params, needs more exploration pressure
   value_coef: 0.5
   max_grad_norm: 0.5
   lr_actor: 1.0e-4

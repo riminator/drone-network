@@ -376,6 +376,8 @@ def train(cfg: dict, resume_checkpoint: str | None = None):
             actor.reset_delay_buffer()
         ep_rewards: list[float] = []
         ep_reward = 0.0
+        _ep_tasks_done: list[int] = []
+        _ep_tasks_total: list[int] = []
 
         for _ in range(rollout_steps):
             with torch.no_grad():
@@ -405,7 +407,7 @@ def train(cfg: dict, resume_checkpoint: str | None = None):
             shared_value = values_tensor[0].item()
             value_dict = {aid: shared_value for aid in agent_ids}
 
-            next_obs_dict, reward_dict, terminated, truncated, _ = env.step(action_dict)
+            next_obs_dict, reward_dict, terminated, truncated, infos = env.step(action_dict)
 
             raw_rewards = np.array([reward_dict.get(aid, 0.0) for aid in agent_ids])
             if reward_normalizer is not None:
@@ -430,6 +432,10 @@ def train(cfg: dict, resume_checkpoint: str | None = None):
             if episode_done:
                 ep_rewards.append(ep_reward)
                 ep_reward = 0.0
+                # Track task completion from any agent's info dict
+                info = next(iter(infos.values())) if infos else {}
+                _ep_tasks_done.append(info.get("tasks_completed", 0))
+                _ep_tasks_total.append(info.get("tasks_total", 1))
                 obs_dict, _ = env.reset()
                 if is_comm:
                     actor.reset_delay_buffer()
@@ -454,11 +460,16 @@ def train(cfg: dict, resume_checkpoint: str | None = None):
         log_interval = cfg["logging"]["log_interval"]
         if update_count % log_interval == 0:
             mean_ep_reward = float(np.mean(ep_rewards)) if ep_rewards else 0.0
+            task_pct = (
+                100.0 * sum(_ep_tasks_done) / max(sum(_ep_tasks_total), 1)
+                if _ep_tasks_done else 0.0
+            )
             elapsed = time.time() - start_time
             print(
                 f"Update {update_count:5d} | "
                 f"Steps {timesteps_collected:>10,} | "
                 f"MeanReward {mean_ep_reward:+7.2f} | "
+                f"Tasks {task_pct:5.1f}% | "
                 f"PolicyLoss {loss_stats['policy_loss']:+.4f} | "
                 f"ValueLoss {loss_stats['value_loss']:.4f} | "
                 f"Entropy {loss_stats['entropy']:.4f} | "
