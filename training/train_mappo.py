@@ -296,7 +296,20 @@ def train(cfg: dict, resume_checkpoint: str | None = None):
             # new keys (GATv2 layers) are silently skipped.
             actor.load_state_dict(ckpt["actor_state_dict"], strict=False)
         if "critic_state_dict" in ckpt:
-            critic.load_state_dict(ckpt["critic_state_dict"])
+            # Guard against shape mismatch when resuming with a different n_drones.
+            # The critic input dim is n_drones × obs_dim; if it changed (e.g. warm-
+            # starting a 6-drone run from a 3-drone checkpoint) we skip the critic
+            # and let it train from random init with the correct architecture.
+            ckpt_critic_in = ckpt["critic_state_dict"]["net.0.weight"].shape[1]
+            curr_critic_in = critic.net[0].weight.shape[1]
+            if ckpt_critic_in == curr_critic_in:
+                critic.load_state_dict(ckpt["critic_state_dict"])
+            else:
+                print(
+                    f"[RESUME] Critic shape mismatch "
+                    f"(checkpoint input={ckpt_critic_in}, current={curr_critic_in}) "
+                    f"— skipping critic weights, training from scratch."
+                )
         print(f"[RESUME] Loaded weights from {resume_checkpoint} "
               f"(update={ckpt.get('update','?')} ts={ckpt.get('timesteps','?'):,})\n")
 
