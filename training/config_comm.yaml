@@ -1,0 +1,74 @@
+# ============================================================
+# Communication-aware execution training config
+#
+# Trains CommActor (GATv2 message-passing + MLP trunk) on HomeEnv.
+# Three comm_radius values are provided as comments — pick one:
+#   float("inf")  fully connected  (best quality, most info)
+#   5.0           half-room range  (realistic indoor RF)
+#   2.0           tight local      (tests near-neighbour-only signalling)
+#
+# Warm-start from an existing execution checkpoint with --resume
+# to avoid learning movement from scratch:
+#
+#   python3 -m training.train_mappo \
+#       --config training/config_comm.yaml \
+#       --resume checkpoints/actor_update580_final.pt
+#
+# Note: actor_update*.pt checkpoints store "actor_state_dict".
+#   CommActor shares the trunk+head architecture with Actor, so
+#   --resume will load the trunk and heads; the GATv2 node_encoder
+#   and attention weights start from random init (expected).
+# ============================================================
+
+env:
+  n_drones: 6
+  room_size: [10.0, 10.0, 3.0]
+  max_steps: 500
+  coop_time_threshold: 0.7
+  obs_noise_std: 0.25
+
+model:
+  obs_dim: 15
+  act_dim: 4
+  actor_type: "comm"          # "mlp" (default Actor) | "comm" (CommActor)
+  actor_hidden: [256, 256]
+  critic_hidden: [512, 256]
+
+  # CommActor-specific parameters
+  comm:
+    embed_dim: 64             # node embedding size; must be divisible by n_heads
+    n_heads: 4                # GATv2 attention heads
+    comm_radius: .inf         # metres — .inf = fully connected
+    comm_delay: 0             # steps of message delay (0 = instant)
+    drop_comm_prob: 0.1       # per-edge drop during training (robustness aug)
+
+training:
+  total_timesteps: 5_000_000
+  rollout_steps: 4096
+  mini_batch_size: 256
+  n_epochs: 5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  entropy_coef: 0.005
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  lr_actor: 1.0e-4            # same fine-tune LR as main config
+  lr_critic: 1.0e-3
+  normalise_rewards: true
+  device: "auto"
+
+curriculum:
+  enabled: true
+  stage_thresholds: [5.0, 15.0, 30.0, 50.0]
+  patience: 3
+
+logging:
+  log_interval: 10
+  eval_interval: 50
+  eval_episodes: 5
+  checkpoint_interval: 100
+  checkpoint_dir: "checkpoints_comm"
+  use_wandb: false
+  wandb_project: "drone-swarm"
+  wandb_entity: null

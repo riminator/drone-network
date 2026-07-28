@@ -31,6 +31,7 @@ import yaml
 from envs.home_env import HomeEnv
 from envs.pybullet_env import PybulletHomeEnv
 from models.actor import Actor
+from models.comm_actor import CommActor
 from models.critic import CentralCritic
 from utils.replay_buffer import RolloutBuffer
 from utils.reward_shaping import RewardNormalizer, CurriculumScheduler
@@ -43,6 +44,29 @@ from utils.reward_shaping import RewardNormalizer, CurriculumScheduler
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def build_actor(cfg: dict) -> Actor | CommActor:
+    """Instantiate Actor or CommActor based on model.actor_type in config."""
+    actor_type = cfg["model"].get("actor_type", "mlp")
+    obs_dim    = cfg["model"]["obs_dim"]
+    act_dim    = cfg["model"]["act_dim"]
+    hidden     = cfg["model"]["actor_hidden"]
+
+    if actor_type == "comm":
+        comm = cfg["model"].get("comm", {})
+        return CommActor(
+            obs_dim        = obs_dim,
+            act_dim        = act_dim,
+            embed_dim      = comm.get("embed_dim", 64),
+            n_heads        = comm.get("n_heads", 4),
+            hidden_sizes   = hidden,
+            comm_radius    = comm.get("comm_radius", float("inf")),
+            comm_delay     = comm.get("comm_delay", 0),
+            drop_comm_prob = comm.get("drop_comm_prob", 0.0),
+        )
+    # Default: plain MLP actor
+    return Actor(obs_dim=obs_dim, act_dim=act_dim, hidden_sizes=hidden)
 
 
 def build_global_obs(
@@ -66,7 +90,7 @@ def dict_to_tensor(d: dict[str, np.ndarray], agent_ids: list[str], device: str):
 
 def ppo_update(
     buffer: RolloutBuffer,
-    actor: Actor,
+    actor: Actor | CommActor,
     critic: CentralCritic,
     actor_optim: optim.Optimizer,
     critic_optim: optim.Optimizer,
@@ -79,6 +103,7 @@ def ppo_update(
     max_grad_norm = cfg["training"]["max_grad_norm"]
     n_epochs = cfg["training"]["n_epochs"]
     mini_batch_size = cfg["training"]["mini_batch_size"]
+    is_comm = isinstance(actor, CommActor)
 
     stats = {"policy_loss": [], "value_loss": [], "entropy": [], "total_loss": []}
 
@@ -92,7 +117,14 @@ def ppo_update(
             global_obs = batch["global_obs"] # (B, n_agents * obs_dim)
 
             # --- Actor loss (PPO clip) ---
-            new_log_probs, entropy = actor.evaluate_actions(obs, actions)
+            # CommActor.evaluate_actions needs n_agents to reshape the flat
+            # batch back into (B, N, obs_dim) for graph reconstruction.
+            if is_comm:
+                new_log_probs, entropy = actor.evaluate_actions(
+                    obs, actions, n_agents=buffer.n_agents
+                )
+            else:
+                new_log_probs, entropy = actor.evaluate_actions(obs, actions)
             ratio = torch.exp(new_log_probs - old_log_probs)
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
@@ -127,13 +159,21 @@ def ppo_update(
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(env: HomeEnv, actor: Actor, n_episodes: int, device: str) -> float:
+def evaluate(
+    env: HomeEnv,
+    actor: Actor | CommActor,
+    n_episodes: int,
+    device: str,
+) -> float:
     """Run n_episodes deterministically and return mean episode reward."""
     agent_ids = sorted(env._agent_ids)
     total_rewards = []
+    is_comm = isinstance(actor, CommActor)
 
     for _ in range(n_episodes):
         obs_dict, _ = env.reset()
+        if is_comm:
+            actor.reset_delay_buffer()
         ep_reward = 0.0
         done = False
 
@@ -184,18 +224,23 @@ def _save_checkpoint(
     tag: str = "",
 ):
     suffix = f"_{tag}" if tag else ""
-    ckpt_path = checkpoint_dir / f"actor_update{update_count}{suffix}.pt"
-    torch.save(
-        {
-            "update": update_count,
-            "timesteps": timesteps_collected,
-            "actor_state_dict": actor.state_dict(),
-            "critic_state_dict": critic.state_dict(),
-            "actor_optim_state_dict": actor_optim.state_dict(),
-            "critic_optim_state_dict": critic_optim.state_dict(),
-        },
-        ckpt_path,
-    )
+    is_comm = isinstance(actor, CommActor)
+    prefix = "comm_actor" if is_comm else "actor"
+    ckpt_path = checkpoint_dir / f"{prefix}_update{update_count}{suffix}.pt"
+    payload: dict = {
+        "update": update_count,
+        "timesteps": timesteps_collected,
+        "critic_state_dict": critic.state_dict(),
+        "actor_optim_state_dict": actor_optim.state_dict(),
+        "critic_optim_state_dict": critic_optim.state_dict(),
+    }
+    # Store under distinct keys so plain Actor and CommActor checkpoints
+    # cannot be accidentally cross-loaded.
+    if is_comm:
+        payload["comm_actor_state_dict"] = actor.state_dict()
+    else:
+        payload["actor_state_dict"] = actor.state_dict()
+    torch.save(payload, ckpt_path)
     print(f"  [CKPT] Saved {ckpt_path}")
     return ckpt_path
 
@@ -227,11 +272,8 @@ def train(cfg: dict, resume_checkpoint: str | None = None):
     agent_ids = sorted(env._agent_ids)
 
     # --- Models ---
-    actor = Actor(
-        obs_dim=obs_dim,
-        act_dim=act_dim,
-        hidden_sizes=cfg["model"]["actor_hidden"],
-    ).to(device)
+    actor = build_actor(cfg).to(device)
+    is_comm = isinstance(actor, CommActor)
 
     critic = CentralCritic(
         obs_dim=obs_dim,
@@ -242,8 +284,19 @@ def train(cfg: dict, resume_checkpoint: str | None = None):
     # --- Resume from checkpoint if provided ---
     if resume_checkpoint:
         ckpt = torch.load(resume_checkpoint, map_location=device, weights_only=False)
-        actor.load_state_dict(ckpt["actor_state_dict"])
-        critic.load_state_dict(ckpt["critic_state_dict"])
+        # Support resuming either plain Actor checkpoints (key "actor_state_dict")
+        # or CommActor checkpoints (key "comm_actor_state_dict").  When warm-
+        # starting a CommActor from a plain Actor checkpoint we load only the
+        # trunk+head weights that match; the GATv2 node_encoder and attention
+        # layers start from random init (expected and correct).
+        if is_comm and "comm_actor_state_dict" in ckpt:
+            actor.load_state_dict(ckpt["comm_actor_state_dict"])
+        elif "actor_state_dict" in ckpt:
+            # Partial load: keys that match (trunk + heads) are loaded;
+            # new keys (GATv2 layers) are silently skipped.
+            actor.load_state_dict(ckpt["actor_state_dict"], strict=False)
+        if "critic_state_dict" in ckpt:
+            critic.load_state_dict(ckpt["critic_state_dict"])
         print(f"[RESUME] Loaded weights from {resume_checkpoint} "
               f"(update={ckpt.get('update','?')} ts={ckpt.get('timesteps','?'):,})\n")
 
@@ -298,20 +351,24 @@ def train(cfg: dict, resume_checkpoint: str | None = None):
     timesteps_collected = 0
     start_time = time.time()
 
+    actor_label = "CommActor (GATv2)" if is_comm else "Actor (MLP)"
     print(f"Starting MAPPO training — {total_timesteps:,} timesteps, {n_drones} drones")
-    print(f"Device: {device} | Rollout steps: {rollout_steps} | Mini-batch: {cfg['training']['mini_batch_size']}")
+    print(f"Actor: {actor_label} | Device: {device} | Rollout steps: {rollout_steps} | Mini-batch: {cfg['training']['mini_batch_size']}")
     print("Press Ctrl+C at any time to stop safely and save a checkpoint.\n")
 
     while timesteps_collected < total_timesteps and not _stop_training:
         # ---- Rollout collection ----
         buffer.reset()
+        if is_comm:
+            actor.reset_delay_buffer()
         ep_rewards: list[float] = []
         ep_reward = 0.0
 
         for _ in range(rollout_steps):
             with torch.no_grad():
                 obs_tensor = dict_to_tensor(obs_dict, agent_ids, device)
-                # get_action now returns (squashed_action, raw_action, log_prob)
+                # CommActor.get_action expects the full (N, obs_dim) tensor;
+                # Actor.get_action accepts the same shape — no difference here.
                 squashed_tensor, raw_tensor, log_probs_tensor = actor.get_action(obs_tensor)
 
                 global_obs_np = build_global_obs(obs_dict, agent_ids, obs_dim)
@@ -361,6 +418,8 @@ def train(cfg: dict, resume_checkpoint: str | None = None):
                 ep_rewards.append(ep_reward)
                 ep_reward = 0.0
                 obs_dict, _ = env.reset()
+                if is_comm:
+                    actor.reset_delay_buffer()
             else:
                 obs_dict = next_obs_dict
 

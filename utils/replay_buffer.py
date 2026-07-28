@@ -4,6 +4,16 @@ Fixed-size on-policy rollout buffer for MAPPO.
 
 Stores trajectories for all agents and computes GAE (Generalised Advantage
 Estimation) before each policy update.
+
+CommActor note
+--------------
+When training with CommActor, evaluate_actions() needs the full swarm obs
+(all N drones at each timestep) to reconstruct the communication graph.
+The buffer already stores obs in shape (n_steps, n_agents, obs_dim), so
+get_batches() also yields "all_obs" — the same step's swarm matrix repeated
+for each agent row, shape (B, n_agents * obs_dim) — but for CommActor the
+reshape happens inside CommActor.evaluate_actions using the n_agents field
+exposed here as self.n_agents.
 """
 
 from __future__ import annotations
