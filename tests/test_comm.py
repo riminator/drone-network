@@ -266,39 +266,59 @@ class TestCommActorGetAction:
 # CommActor.evaluate_actions
 # ===========================================================================
 
+def _make_swarm_obs(obs: torch.Tensor, n_agents: int) -> torch.Tensor:
+    """
+    Build a (B, N, obs_dim) swarm_obs tensor from a flat (B, obs_dim) obs.
+    Each row i is mapped to agent slot (i % n_agents) in its timestep.
+    This mirrors what the RolloutBuffer provides in practice.
+    """
+    b = obs.size(0)
+    obs_dim = obs.size(1)
+    n_steps = (b + n_agents - 1) // n_agents
+    swarm = torch.zeros(b, n_agents, obs_dim)
+    for i in range(b):
+        agent_slot = i % n_agents
+        swarm[i, agent_slot] = obs[i]
+    return swarm
+
+
 class TestCommActorEvaluateActions:
     def test_output_shapes(self):
         actor    = _make_comm_actor()
         N, B     = 3, 8
-        obs      = _random_obs(N * B)
-        actions  = torch.randn(N * B, 4)
-        lp, ent  = actor.evaluate_actions(obs, actions, n_agents=N)
-        assert lp.shape  == (N * B,)
-        assert ent.shape == (N * B,)
+        obs      = _random_obs(B)
+        actions  = torch.randn(B, 4)
+        sw       = _make_swarm_obs(obs, N)
+        lp, ent  = actor.evaluate_actions(obs, actions, swarm_obs=sw)
+        assert lp.shape  == (B,)
+        assert ent.shape == (B,)
 
     def test_log_probs_finite(self):
         actor   = _make_comm_actor()
         N, B    = 3, 10
-        obs     = _random_obs(N * B)
-        actions = torch.randn(N * B, 4)
-        lp, _   = actor.evaluate_actions(obs, actions, n_agents=N)
+        obs     = _random_obs(B)
+        actions = torch.randn(B, 4)
+        sw      = _make_swarm_obs(obs, N)
+        lp, _   = actor.evaluate_actions(obs, actions, swarm_obs=sw)
         assert torch.all(torch.isfinite(lp))
 
     def test_entropy_positive(self):
         actor   = _make_comm_actor()
         N, B    = 3, 10
-        obs     = _random_obs(N * B)
-        actions = torch.randn(N * B, 4)
-        _, ent  = actor.evaluate_actions(obs, actions, n_agents=N)
+        obs     = _random_obs(B)
+        actions = torch.randn(B, 4)
+        sw      = _make_swarm_obs(obs, N)
+        _, ent  = actor.evaluate_actions(obs, actions, swarm_obs=sw)
         assert torch.all(ent > 0), "Entropy of a Gaussian must be positive"
 
     def test_gradients_flow(self):
         """PPO requires gradients through log_probs back to actor parameters."""
         actor   = _make_comm_actor()
         N, B    = 3, 4
-        obs     = _random_obs(N * B)
-        actions = torch.randn(N * B, 4)
-        lp, _   = actor.evaluate_actions(obs, actions, n_agents=N)
+        obs     = _random_obs(B)
+        actions = torch.randn(B, 4)
+        sw      = _make_swarm_obs(obs, N)
+        lp, _   = actor.evaluate_actions(obs, actions, swarm_obs=sw)
         lp.sum().backward()
         has_grad = any(
             p.grad is not None and p.grad.abs().sum() > 0
@@ -306,14 +326,15 @@ class TestCommActorEvaluateActions:
         )
         assert has_grad, "No gradients flowed to CommActor parameters"
 
-    def test_single_step_batch(self):
-        """B=1 step (edge case for the reshape loop)."""
+    def test_single_row_batch(self):
+        """B=1 row (edge case for the per-row loop)."""
         actor   = _make_comm_actor()
         N       = 3
-        obs     = _random_obs(N)
-        actions = torch.randn(N, 4)
-        lp, _   = actor.evaluate_actions(obs, actions, n_agents=N)
-        assert lp.shape == (N,)
+        obs     = _random_obs(1)
+        actions = torch.randn(1, 4)
+        sw      = _make_swarm_obs(obs, N)
+        lp, _   = actor.evaluate_actions(obs, actions, swarm_obs=sw)
+        assert lp.shape == (1,)
 
 
 # ===========================================================================

@@ -117,11 +117,11 @@ def ppo_update(
             global_obs = batch["global_obs"] # (B, n_agents * obs_dim)
 
             # --- Actor loss (PPO clip) ---
-            # CommActor.evaluate_actions needs n_agents to reshape the flat
-            # batch back into (B, N, obs_dim) for graph reconstruction.
             if is_comm:
+                # CommActor.evaluate_actions uses swarm_obs (B, N, obs_dim)
+                # provided by the buffer so each row can come from any timestep.
                 new_log_probs, entropy = actor.evaluate_actions(
-                    obs, actions, n_agents=buffer.n_agents
+                    obs, actions, swarm_obs=batch["swarm_obs"]
                 )
             else:
                 new_log_probs, entropy = actor.evaluate_actions(obs, actions)

@@ -339,34 +339,36 @@ class CommActor(nn.Module):
 
     def evaluate_actions(
         self,
-        all_obs: torch.Tensor,       # (B*N, obs_dim)   — flattened buffer
-        raw_actions: torch.Tensor,   # (B*N, act_dim)
-        n_agents: int,               # N — needed to reshape into (B, N, obs_dim)
+        all_obs: torch.Tensor,       # (B, obs_dim)   — one row per agent-step
+        raw_actions: torch.Tensor,   # (B, act_dim)
+        swarm_obs: torch.Tensor,     # (B, N, obs_dim) — full swarm at each row's timestep
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Recompute log_probs and entropy for a mini-batch.
 
-        The buffer stores obs flat (B*N, obs_dim).  We reshape into
-        (B, N, obs_dim), run the GATv2 over each step's full swarm obs,
-        then flatten back to (B*N, embed_dim) for the MLP trunk.
+        swarm_obs[i] is the complete (N, obs_dim) observation matrix at the
+        timestep that produced row i.  The buffer provides this via its
+        "swarm_obs" key so rows from different timesteps can be mixed freely.
 
-        Note: comm_delay is NOT applied during evaluate_actions because the
-        buffer already stores the obs that were used during collection.
-        We reconstruct the same graph the policy saw at collection time.
+        comm_delay is NOT applied: the buffer already captured the obs that
+        were visible at collection time; we reconstruct that same graph.
         """
-        b_total = all_obs.size(0)
-        b = b_total // n_agents
+        b = all_obs.size(0)          # total rows in this mini-batch
 
-        # Reshape: (B, N, obs_dim)
-        obs_bnd = all_obs.view(b, n_agents, self.obs_dim)
-
+        # Run GATv2 on each row's timestep swarm context, then take only the
+        # attended embedding for the agent that owns row i.
+        # swarm_obs: (B, N, obs_dim) — _attend expects (N, obs_dim)
         agg_list = []
-        for step_idx in range(b):
-            step_obs = obs_bnd[step_idx]                 # (N, obs_dim)
-            agg = self._attend(step_obs, training=True)  # (N, embed_dim)
-            agg_list.append(agg)
-        agg_all = torch.stack(agg_list, dim=0)           # (B, N, embed_dim)
-        agg_flat = agg_all.view(b_total, self.embed_dim) # (B*N, embed_dim)
+        for i in range(b):
+            agg_all_agents = self._attend(swarm_obs[i], training=True)  # (N, embed_dim)
+            # Identify which agent slot this row belongs to by matching its obs
+            # to the closest row in swarm_obs[i].  The buffer always places agent
+            # j at swarm_obs[i, j], so we just pick the slot whose obs equals
+            # all_obs[i].  Use argmin of L2 distance for robustness against noise.
+            dists = ((swarm_obs[i] - all_obs[i].unsqueeze(0)) ** 2).sum(-1)  # (N,)
+            agent_slot = dists.argmin()
+            agg_list.append(agg_all_agents[agent_slot])   # (embed_dim,)
+        agg_flat = torch.stack(agg_list, dim=0)           # (B, embed_dim)
 
         combined = torch.cat([all_obs, agg_flat], dim=-1)
         features = self.trunk(combined)

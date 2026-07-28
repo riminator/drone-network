@@ -154,29 +154,49 @@ class RolloutBuffer:
         """
         Yields mini-batches of flattened (timestep × agent) transitions.
         Each batch is a dict of torch tensors on self.device.
+
+        Extra keys for CommActor:
+          "swarm_obs"  — (B, n_agents, obs_dim): the full swarm observation at
+                         the timestep each row came from.  CommActor.evaluate_actions
+                         uses this to reconstruct the communication graph without
+                         needing to assume contiguous same-step rows in the batch.
         """
         n = self.n_steps
-        # Flatten: (n_steps * n_agents, ...)
+        # Per-row timestep index: flat row r came from timestep t = r // n_agents
+        # We need this to look up the right swarm_obs slice for each row.
+        # Shape: (n_steps * n_agents,) — value is the timestep index 0..n_steps-1
+        timestep_idx = np.repeat(np.arange(n), self.n_agents)  # (n_steps * n_agents,)
+
+        # Flatten per-agent fields: (n_steps * n_agents, ...)
         flat = {
-            "obs":        torch.tensor(self.obs.reshape(-1, self.obs_dim),   device=self.device),
+            "obs":        torch.tensor(self.obs.reshape(-1, self.obs_dim),     device=self.device),
             "actions":    torch.tensor(self.actions.reshape(-1, self.act_dim), device=self.device),
-            "log_probs":  torch.tensor(self.log_probs.reshape(-1),           device=self.device),
-            "values":     torch.tensor(self.values.reshape(-1),              device=self.device),
-            "returns":    torch.tensor(self.returns.reshape(-1),             device=self.device),
-            "advantages": torch.tensor(self.advantages.reshape(-1),         device=self.device),
+            "log_probs":  torch.tensor(self.log_probs.reshape(-1),             device=self.device),
+            "values":     torch.tensor(self.values.reshape(-1),                device=self.device),
+            "returns":    torch.tensor(self.returns.reshape(-1),               device=self.device),
+            "advantages": torch.tensor(self.advantages.reshape(-1),           device=self.device),
         }
-        # Global obs for critic: concatenate all agents per timestep
+
+        # Global obs for critic: (n_steps * n_agents, n_agents * obs_dim)
         global_obs = self.obs.reshape(n, -1)  # (n_steps, n_agents * obs_dim)
         flat["global_obs"] = torch.tensor(
             np.repeat(global_obs, self.n_agents, axis=0),
             device=self.device,
         )
 
+        # Swarm obs for CommActor: (n_steps, n_agents, obs_dim) tensor
+        # We store it once and index into it per mini-batch using timestep_idx.
+        swarm_obs_full = torch.tensor(self.obs, device=self.device)  # (n_steps, N, obs_dim)
+
         total = n * self.n_agents
         indices = np.random.permutation(total)
         for start in range(0, total, mini_batch_size):
             idx = indices[start: start + mini_batch_size]
-            yield {k: v[idx] for k, v in flat.items()}
+            batch = {k: v[idx] for k, v in flat.items()}
+            # swarm_obs[i] = full swarm obs at the timestep row idx[i] came from
+            t_idx = timestep_idx[idx]               # (B,) timestep indices
+            batch["swarm_obs"] = swarm_obs_full[t_idx]  # (B, N, obs_dim)
+            yield batch
 
     def reset(self):
         self._ptr = 0
