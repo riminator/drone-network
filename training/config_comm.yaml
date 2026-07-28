@@ -44,16 +44,16 @@ model:
 
 training:
   total_timesteps: 5_000_000
-  rollout_steps: 4096
-  mini_batch_size: 256
-  n_epochs: 5
+  rollout_steps: 1024          # shorter rollouts — faster updates on CPU
+  mini_batch_size: 128         # smaller batches — fewer unique-timestep deduplication calls
+  n_epochs: 4
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
   entropy_coef: 0.005
   value_coef: 0.5
   max_grad_norm: 0.5
-  lr_actor: 1.0e-4            # same fine-tune LR as main config
+  lr_actor: 1.0e-4
   lr_critic: 1.0e-3
   normalise_rewards: true
   device: "auto"
@@ -64,10 +64,10 @@ curriculum:
   patience: 3
 
 logging:
-  log_interval: 10
-  eval_interval: 50
-  eval_episodes: 5
-  checkpoint_interval: 100
+  log_interval: 1              # print every update — CommActor is slow on CPU
+  eval_interval: 20
+  eval_episodes: 3
+  checkpoint_interval: 50
   checkpoint_dir: "checkpoints_comm"
   use_wandb: false
   wandb_project: "drone-swarm"
