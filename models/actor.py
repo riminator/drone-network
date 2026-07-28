@@ -36,6 +36,7 @@ class Actor(nn.Module):
         hidden_sizes: list[int] = None,
     ):
         super().__init__()
+        self.obs_dim = obs_dim
         hidden_sizes = hidden_sizes or [256, 256]
 
         layers: list[nn.Module] = []
