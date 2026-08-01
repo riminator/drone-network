@@ -275,7 +275,40 @@ def install_gym_pybullet_drones():
         print("gym-pybullet-drones already installed — skipping.")
         return
 
-    pip("git+https://github.com/utiasDSL/gym-pybullet-drones.git")
+    # Prefer git+https install; fall back to zip if git is not in PATH (common on Windows).
+    has_git = shutil.which("git") is not None
+
+    if has_git:
+        result = run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+             "git+https://github.com/utiasDSL/gym-pybullet-drones.git"],
+            check=False,
+        )
+        if result.returncode == 0:
+            print("gym-pybullet-drones installed via git ✓")
+            return
+        print("[WARN] git install failed — trying zip fallback.")
+    else:
+        print("[WARN] git not found in PATH — using zip archive fallback.")
+
+    # Zip fallback: pip can download and install a GitHub zip without git.
+    zip_url = "https://github.com/utiasDSL/gym-pybullet-drones/archive/refs/heads/main.zip"
+    result = run(
+        [sys.executable, "-m", "pip", "install", "--no-cache-dir", zip_url],
+        check=False,
+    )
+    if result.returncode == 0:
+        print("gym-pybullet-drones installed via zip ✓")
+    else:
+        print(
+            "\n[ERROR] gym-pybullet-drones install failed.\n"
+            "  This package is only needed for the PyBullet physics lab (lab/deploy.py).\n"
+            "  Training and evaluation work fine without it.\n"
+            "\n  To install manually:\n"
+            "    pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git\n"
+            "  or (no git required):\n"
+            f"    pip install {zip_url}\n"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -297,39 +330,76 @@ def install_optional():
 # Verification
 # ---------------------------------------------------------------------------
 
+# Checks marked True are required; False = optional (PyBullet physics lab only).
+_CHECKS: list[tuple[str, str, bool]] = [
+    ("numpy",
+     "import numpy; print('  numpy', numpy.__version__)",
+     True),
+    ("gymnasium",
+     "import gymnasium; print('  gymnasium', gymnasium.__version__)",
+     True),
+    ("torch",
+     "import torch; print('  torch', torch.__version__)",
+     True),
+    ("scipy",
+     "import scipy; print('  scipy', scipy.__version__)",
+     True),
+    ("pybullet",
+     "import pybullet; print('  pybullet OK')",
+     False),
+    ("gym_pybullet_drones",
+     "from gym_pybullet_drones.envs.VelocityAviary import VelocityAviary; print('  gym-pybullet-drones OK')",
+     False),
+    ("project envs",
+     "import sys; sys.path.insert(0,'.'); from envs.pybullet_env import PybulletHomeEnv, _PYBULLET_AVAILABLE; print('  PybulletHomeEnv, pybullet_available =', _PYBULLET_AVAILABLE)",
+     False),
+    ("project lab",
+     "import sys; sys.path.insert(0,'.'); from lab.deploy import deploy; print('  lab.deploy OK')",
+     False),
+]
+
+
 def verify():
     header("Verification")
-    checks = {
-        "numpy":              "import numpy; print('  numpy', numpy.__version__)",
-        "gymnasium":          "import gymnasium; print('  gymnasium', gymnasium.__version__)",
-        "torch":              "import torch; print('  torch', torch.__version__)",
-        "pybullet":           "import pybullet; print('  pybullet OK')",
-        "gym_pybullet_drones":"from gym_pybullet_drones.envs.VelocityAviary import VelocityAviary; print('  gym-pybullet-drones OK')",
-        "project envs":       "import sys; sys.path.insert(0,'.'); from envs.pybullet_env import PybulletHomeEnv, _PYBULLET_AVAILABLE; print('  PybulletHomeEnv, pybullet_available =', _PYBULLET_AVAILABLE)",
-        "project lab":        "import sys; sys.path.insert(0,'.'); from lab.deploy import deploy; print('  lab.deploy OK')",
-    }
 
-    all_ok = True
-    for name, snippet in checks.items():
+    required_ok = True
+    optional_failed: list[str] = []
+
+    for name, snippet, required in _CHECKS:
         result = subprocess.run(
             [sys.executable, "-c", snippet],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
-            print(f"✓  {name}: {result.stdout.strip()}")
+            tag = "✓ " if required else "✓ (optional)"
+            print(f"{tag}  {name}: {result.stdout.strip()}")
         else:
-            print(f"✗  {name}: FAILED\n   {result.stderr.strip()[:200]}")
-            all_ok = False
+            err = result.stderr.strip()[:400]
+            if required:
+                print(f"✗  {name}: FAILED\n   {err}")
+                required_ok = False
+            else:
+                print(f"⚠  {name}: not available (optional — needed for PyBullet lab only)\n   {err}")
+                optional_failed.append(name)
 
     print()
-    if all_ok:
-        print("All checks passed — you're ready to train and deploy.")
+    if required_ok:
+        print("Core packages OK — training and evaluation are ready.")
         print("\nTo start training:")
         print("  python -m training.train_mappo")
-        print("\nTo deploy a checkpoint:")
-        print("  python -m lab.deploy --checkpoint checkpoints/<file>.pt")
+        print("\nTo run the evaluation benchmark:")
+        print("  python -m evaluation.eval_allocation --episodes 3")
+        if optional_failed:
+            print(
+                f"\n⚠  Optional PyBullet packages missing: {', '.join(optional_failed)}\n"
+                "   Training and eval work fine without them.\n"
+                "   To install manually:\n"
+                "     pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git\n"
+                "   or (no git required):\n"
+                "     pip install https://github.com/utiasDSL/gym-pybullet-drones/archive/refs/heads/main.zip"
+            )
     else:
-        print("Some checks failed — review the errors above.")
+        print("Required packages failed — review the errors above.")
         sys.exit(1)
 
 
