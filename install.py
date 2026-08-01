@@ -275,7 +275,7 @@ def install_gym_pybullet_drones():
         print("gym-pybullet-drones already installed — skipping.")
         return
 
-    # Prefer git+https install; fall back to zip if git is not in PATH (common on Windows).
+    # Prefer git+https install — cleanest, works on macOS/Linux.
     has_git = shutil.which("git") is not None
 
     if has_git:
@@ -287,28 +287,74 @@ def install_gym_pybullet_drones():
         if result.returncode == 0:
             print("gym-pybullet-drones installed via git ✓")
             return
-        print("[WARN] git install failed — trying zip fallback.")
+        print("[WARN] git install failed — trying download+extract fallback.")
     else:
-        print("[WARN] git not found in PATH — using zip archive fallback.")
+        print("[WARN] git not found in PATH — using download+extract fallback.")
 
-    # Zip fallback: pip can download and install a GitHub zip without git.
-    zip_url = "https://github.com/utiasDSL/gym-pybullet-drones/archive/refs/heads/main.zip"
-    result = run(
-        [sys.executable, "-m", "pip", "install", "--no-cache-dir", zip_url],
-        check=False,
-    )
-    if result.returncode == 0:
-        print("gym-pybullet-drones installed via zip ✓")
-    else:
-        print(
-            "\n[ERROR] gym-pybullet-drones install failed.\n"
-            "  This package is only needed for the PyBullet physics lab (lab/deploy.py).\n"
-            "  Training and evaluation work fine without it.\n"
-            "\n  To install manually:\n"
-            "    pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git\n"
-            "  or (no git required):\n"
-            f"    pip install {zip_url}\n"
+    # Fallback: download the zip manually, extract to a temp dir, then
+    # pip install the extracted folder.  This avoids the Windows pip bug
+    # where `pip install <zip_url>` fails with "cannot unpack file" because
+    # pip treats the GitHub archive as a wheel rather than a source tree.
+    _install_gpd_from_zip()
+
+
+def _install_gpd_from_zip():
+    import urllib.request
+    import zipfile
+
+    ZIP_URL = "https://github.com/utiasDSL/gym-pybullet-drones/archive/refs/heads/main.zip"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        zip_path = tmpdir / "gym-pybullet-drones.zip"
+
+        print(f"Downloading gym-pybullet-drones archive...")
+        try:
+            urllib.request.urlretrieve(ZIP_URL, zip_path)
+        except Exception as e:
+            print(f"\n[ERROR] Download failed: {e}")
+            _print_gpd_manual_instructions()
+            return
+
+        print("Extracting...")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(tmpdir)
+
+        # GitHub zips extract to a folder named  <repo>-<branch>
+        extracted = tmpdir / "gym-pybullet-drones-main"
+        if not extracted.exists():
+            # Fallback: find whatever directory was created
+            dirs = [d for d in tmpdir.iterdir() if d.is_dir()]
+            if not dirs:
+                print("[ERROR] Could not find extracted source directory.")
+                _print_gpd_manual_instructions()
+                return
+            extracted = dirs[0]
+
+        print(f"Installing from extracted source: {extracted.name}")
+        result = run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", str(extracted)],
+            check=False,
         )
+        if result.returncode == 0:
+            print("gym-pybullet-drones installed via zip+extract ✓")
+        else:
+            _print_gpd_manual_instructions()
+
+
+def _print_gpd_manual_instructions():
+    print(
+        "\n[ERROR] gym-pybullet-drones install failed.\n"
+        "  This package is only needed for the PyBullet physics lab (lab/deploy.py).\n"
+        "  Training and evaluation work fine without it.\n"
+        "\n  To install manually (pick one):\n"
+        "    # Option A — if you have git:\n"
+        "    pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git\n"
+        "\n    # Option B — no git needed (download zip, extract, install):\n"
+        "    1. Download: https://github.com/utiasDSL/gym-pybullet-drones/archive/refs/heads/main.zip\n"
+        "    2. Extract the zip to a folder, e.g. C:\\gym-pybullet-drones-main\\\n"
+        "    3. Run: pip install C:\\gym-pybullet-drones-main\\\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -393,10 +439,10 @@ def verify():
             print(
                 f"\n⚠  Optional PyBullet packages missing: {', '.join(optional_failed)}\n"
                 "   Training and eval work fine without them.\n"
-                "   To install manually:\n"
-                "     pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git\n"
-                "   or (no git required):\n"
-                "     pip install https://github.com/utiasDSL/gym-pybullet-drones/archive/refs/heads/main.zip"
+                "   To install, re-run:  python install.py\n"
+                "   (the installer will download+extract the zip automatically)\n"
+                "   Or manually:\n"
+                "     pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git"
             )
     else:
         print("Required packages failed — review the errors above.")
@@ -422,11 +468,11 @@ Windows Compatibility Notes
 ⚠  PyBullet GUI — works on Windows but requires a display.
                   No changes needed; the GUI window will open.
 
-⚠  gym-pybullet-drones — pip-installable from GitHub on Windows,
-                  but requires Git in PATH:
+⚠  gym-pybullet-drones — the installer handles this automatically.
+                  It tries git first, then falls back to downloading
+                  and extracting the zip — no manual steps needed.
+                  If it still fails, install Git and re-run:
                     winget install Git.Git
-                  or install from zip:
-                    pip install https://github.com/utiasDSL/gym-pybullet-drones/archive/main.zip
 
 ⚠  Multiprocessing — Ray RLlib (optional, not required by this project)
                   has known issues on Windows with spawn-mode.
