@@ -139,9 +139,15 @@ _DRONE_COLOURS = [
     [0.70, 0.40, 1.00, 0.85],   # 7  violet
 ]
 
-# Disc radius (m) used for the visual-only drone body overlay.
-# Sized for a 10×10 m room — large enough to see at a glance.
-_DRONE_VISUAL_RADIUS = 0.8
+# X-frame quadrotor visual dimensions (room-scaled for a 10×10 m space)
+_DRONE_BODY_HALF    = 0.22   # central body box half-side (m)
+_DRONE_ARM_RADIUS   = 0.07   # arm cylinder radius
+_DRONE_ARM_LEN      = 0.45   # half-length of each arm (centre → tip)
+_DRONE_PROP_RADIUS  = 0.25   # propeller disc radius
+_DRONE_PROP_THICK   = 0.04   # propeller disc thickness
+
+# How many recent positions to keep for the trajectory trail per drone
+_TRAIL_LEN = 18   # ~0.4 s at 48 Hz control
 
 
 def _make_task(task_type: str, idx: int, target: list, engage_steps: int):
@@ -245,10 +251,20 @@ class PybulletHomeEnv(MultiAgentEnv):
         # Most recent bids from the last allocation round (empty until first alloc)
         self._last_bids: list[Bid] = []
 
-        # Visual-override shape IDs — large coloured discs that replace the tiny
-        # Crazyflie mesh so drones are visible at room scale.  Rebuilt after each
-        # reset() because p.resetSimulation() wipes all visual shape registrations.
-        self._drone_visual_shape_ids: list[int] = []    # one per drone
+        # Visual-override body IDs — X-frame quad shapes attached to each drone.
+        # Rebuilt after each reset() because p.resetSimulation() wipes everything.
+        self._drone_visual_body_ids: list[int] = []     # one multibody per drone
+
+        # Trajectory trail: ring-buffer of recent real positions per drone.
+        # Stored as list-of-lists (drone_idx → deque of xyz arrays).
+        self._trail_positions: list[list] = [[] for _ in range(self.n_drones)]
+        self._trail_line_ids:  list[list] = [[] for _ in range(self.n_drones)]
+
+        # Tool-engage glow ring IDs (one per drone; -1 = not visible).
+        self._glow_ids: list[int] = [-1] * self.n_drones
+
+        # Task-completion burst state: list of (body_id, steps_remaining, phase).
+        self._burst_items: list[tuple[int, int, int]] = []
 
         # ── Camera state (GUI only) ───────────────────────────────────────────
         # These are updated each step by _handle_camera_keys() so keyboard/mouse
@@ -420,6 +436,11 @@ class PybulletHomeEnv(MultiAgentEnv):
         self._debug_key_hint_id  = -1
         self._debug_bid_lines    = {}
         self._last_bids          = []
+        self._drone_visual_body_ids = []
+        self._trail_positions    = [[] for _ in range(self.n_drones)]
+        self._trail_line_ids     = [[] for _ in range(self.n_drones)]
+        self._glow_ids           = [-1] * self.n_drones
+        self._burst_items        = []
 
         # resetSimulation removed our scene objects — reload them
         self._task_object_ids = []
@@ -582,6 +603,10 @@ class PybulletHomeEnv(MultiAgentEnv):
 
         if self.gui:
             self._handle_camera_keys(real_positions)
+            self._sync_drone_visuals(real_positions)
+            self._update_trails(real_positions, agent_ids_sorted)
+            self._update_glow(real_positions, agent_ids_sorted)
+            self._update_burst()
             self._update_debug_visuals(real_positions, agent_ids_sorted)
             self._draw_bid_lines(real_positions, agent_ids_sorted)
 
@@ -589,33 +614,97 @@ class PybulletHomeEnv(MultiAgentEnv):
 
     def _apply_drone_visuals(self):
         """
-        Replace the tiny Crazyflie mesh on each drone body with a large coloured
-        flat disc so drones are clearly visible in a 10 m room.
+        Build an X-frame quadrotor visual for each drone using a separate
+        visual-only multibody that tracks the drone via a constraint each step.
 
-        Uses changeVisualShape(shapeIndex=…) which swaps the rendered geometry
-        without touching any physics body, mass, or inertia.  Must be called after
-        every aviary.reset() because p.resetSimulation() wipes the shape registry.
+        Structure per drone:
+          • 1 central box (body)
+          • 2 arm cylinders (NE-SW and NW-SE diagonals)
+          • 4 propeller discs (flat cylinders at arm tips)
+
+        The Crazyflie mesh is hidden (alpha → 0) and the visual multibody is
+        teleported to the drone's real position+orientation every step.
         """
+        if not self.gui:
+            return
         client = self._aviary.getPyBulletClient()
         drone_ids = self._aviary.getDroneIds()
-        self._drone_visual_shape_ids = []
+        self._drone_visual_body_ids = []
 
         for i in range(self.n_drones):
-            colour = _DRONE_COLOURS[i % len(_DRONE_COLOURS)]
-            # Flat horizontal disc — visually obvious from above/side
-            vs = p.createVisualShape(
-                p.GEOM_CYLINDER,
-                radius=_DRONE_VISUAL_RADIUS,
-                length=0.25,
-                rgbaColor=colour,
-                physicsClientId=client,
-            )
+            col = _DRONE_COLOURS[i % len(_DRONE_COLOURS)]
+            dark = [col[0] * 0.55, col[1] * 0.55, col[2] * 0.55, col[3]]  # darker arms
+            prop = [col[0] * 0.85, col[1] * 0.85, col[2] * 0.85, 0.70]    # lighter props
+
+            # Hide the default Crazyflie mesh
             p.changeVisualShape(
                 drone_ids[i], -1,
-                shapeIndex=vs,
+                rgbaColor=[0.0, 0.0, 0.0, 0.0],
                 physicsClientId=client,
             )
-            self._drone_visual_shape_ids.append(vs)
+
+            # Central body box
+            vs_body = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[_DRONE_BODY_HALF, _DRONE_BODY_HALF, _DRONE_BODY_HALF * 0.45],
+                rgbaColor=col,
+                physicsClientId=client,
+            )
+            # Arm NE-SW diagonal (rotated 45°)
+            vs_arm1 = p.createVisualShape(
+                p.GEOM_CYLINDER,
+                radius=_DRONE_ARM_RADIUS,
+                length=_DRONE_ARM_LEN * 2,
+                rgbaColor=dark,
+                visualFrameOrientation=p.getQuaternionFromEuler([0, np.pi/2, np.pi/4]),
+                physicsClientId=client,
+            )
+            # Arm NW-SE diagonal (rotated -45°)
+            vs_arm2 = p.createVisualShape(
+                p.GEOM_CYLINDER,
+                radius=_DRONE_ARM_RADIUS,
+                length=_DRONE_ARM_LEN * 2,
+                rgbaColor=dark,
+                visualFrameOrientation=p.getQuaternionFromEuler([0, np.pi/2, -np.pi/4]),
+                physicsClientId=client,
+            )
+            # Four propeller discs at arm tips (±45°, distance = ARM_LEN from centre)
+            prop_offset = _DRONE_ARM_LEN
+            prop_shapes = []
+            for angle_deg in [45, 135, 225, 315]:
+                a = np.deg2rad(angle_deg)
+                ox, oy = np.cos(a) * prop_offset, np.sin(a) * prop_offset
+                oz = _DRONE_BODY_HALF * 0.3   # slightly above body centre
+                vs_p = p.createVisualShape(
+                    p.GEOM_CYLINDER,
+                    radius=_DRONE_PROP_RADIUS,
+                    length=_DRONE_PROP_THICK,
+                    rgbaColor=prop,
+                    visualFramePosition=[ox, oy, oz],
+                    physicsClientId=client,
+                )
+                prop_shapes.append(vs_p)
+
+            # One static multibody with all shapes as link visual shapes.
+            # baseMass=0 so it has no physics; we teleport it every step.
+            body_id = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=vs_body,
+                basePosition=[0, 0, -100],   # start far below — teleported in step()
+                linkMasses=[0, 0, 0, 0, 0, 0],
+                linkCollisionShapeIndices=[-1, -1, -1, -1, -1, -1],
+                linkVisualShapeIndices=[vs_arm1, vs_arm2] + prop_shapes,
+                linkPositions=[[0,0,0]]*6,
+                linkOrientations=[p.getQuaternionFromEuler([0,0,0])]*6,
+                linkInertialFramePositions=[[0,0,0]]*6,
+                linkInertialFrameOrientations=[p.getQuaternionFromEuler([0,0,0])]*6,
+                linkParentIndices=[0]*6,
+                linkJointTypes=[p.JOINT_FIXED]*6,
+                linkJointAxis=[[0,0,1]]*6,
+                physicsClientId=client,
+            )
+            self._drone_visual_body_ids.append(body_id)
 
     def _update_debug_visuals(
         self,
@@ -820,6 +909,190 @@ class PybulletHomeEnv(MultiAgentEnv):
                 except Exception:
                     pass  # item may already be gone after resetSimulation
 
+    def _sync_drone_visuals(self, real_positions: np.ndarray) -> None:
+        """
+        Teleport the X-frame multibodies to match real drone positions and
+        orientations each step.  Uses resetBasePositionAndOrientation so the
+        kinematic body snaps instantly with no physics involved.
+        """
+        if not self.gui or not self._drone_visual_body_ids:
+            return
+        client = self._aviary.getPyBulletClient()
+        drone_ids = self._aviary.getDroneIds()
+        for i, body_id in enumerate(self._drone_visual_body_ids):
+            pos = real_positions[i].tolist()
+            # Pull the actual Crazyflie quaternion so arms rotate with the physics body
+            _, quat = p.getBasePositionAndOrientation(drone_ids[i], physicsClientId=client)
+            p.resetBasePositionAndOrientation(
+                body_id, pos, quat, physicsClientId=client
+            )
+
+    def _update_trails(
+        self,
+        real_positions: np.ndarray,
+        agent_ids_sorted: list[str],
+    ) -> None:
+        """
+        Draw a fading ghost trail of recent positions for each drone.
+
+        The trail is `_TRAIL_LEN` debug line segments coloured from fully
+        transparent near the head to the drone's colour at the oldest point.
+        Each step we add the new position, drop the oldest, and redraw all
+        segments with updated alpha.
+        """
+        if not self.gui:
+            return
+        client = self._aviary.getPyBulletClient()
+
+        for i in range(self.n_drones):
+            pos = real_positions[i].tolist()
+            self._trail_positions[i].append(pos)
+
+            # Trim to trail length
+            if len(self._trail_positions[i]) > _TRAIL_LEN:
+                self._trail_positions[i].pop(0)
+                # Also drop the corresponding oldest line ID
+                if self._trail_line_ids[i]:
+                    old_id = self._trail_line_ids[i].pop(0)
+                    if old_id != -1:
+                        try:
+                            p.removeUserDebugItem(old_id, physicsClientId=client)
+                        except Exception:
+                            pass
+
+            pts = self._trail_positions[i]
+            if len(pts) < 2:
+                continue
+
+            col = _DRONE_COLOURS[i % len(_DRONE_COLOURS)]
+            # Add one new segment: from second-to-last to last position
+            # Colour alpha fades with age (newest = bright, oldest = dim)
+            seg_idx = len(pts) - 2  # index of newly added segment
+            t = seg_idx / max(_TRAIL_LEN - 1, 1)   # 0 = oldest, 1 = newest
+            brightness = 0.15 + 0.85 * t
+            seg_col = [col[0] * brightness, col[1] * brightness, col[2] * brightness]
+            line_id = p.addUserDebugLine(
+                pts[-2], pts[-1],
+                lineColorRGB=seg_col,
+                lineWidth=2.0 + 1.5 * t,   # thicker at the head
+                physicsClientId=client,
+            )
+            self._trail_line_ids[i].append(line_id)
+
+    def _update_glow(
+        self,
+        real_positions: np.ndarray,
+        agent_ids_sorted: list[str],
+    ) -> None:
+        """
+        Show a bright pulsing ring around a drone while it is engaging its tool.
+        The ring is a thin torus-like cylinder placed at drone position.
+        Glow is shown only when tool_engaged is True.
+        """
+        if not self.gui:
+            return
+        client = self._aviary.getPyBulletClient()
+
+        for i, aid in enumerate(agent_ids_sorted):
+            engaged = self._tool_engaged.get(aid, False)
+            pos = real_positions[i].tolist()
+            ring_pos = [pos[0], pos[1], pos[2]]
+
+            if engaged:
+                # Pulse brightness using step count
+                t = (self._step_count % 12) / 12.0
+                brightness = 0.6 + 0.4 * abs(np.sin(t * np.pi))
+                col = _DRONE_COLOURS[i % len(_DRONE_COLOURS)]
+                ring_col = [min(1.0, col[0] * brightness * 1.4),
+                            min(1.0, col[1] * brightness * 1.4),
+                            min(1.0, col[2] * brightness * 1.4), 0.85]
+
+                if self._glow_ids[i] == -1:
+                    # Create the ring body once
+                    vs = p.createVisualShape(
+                        p.GEOM_CYLINDER,
+                        radius=_DRONE_PROP_RADIUS * 2.2,
+                        length=0.06,
+                        rgbaColor=ring_col,
+                        physicsClientId=client,
+                    )
+                    body_id = p.createMultiBody(
+                        baseMass=0,
+                        baseCollisionShapeIndex=-1,
+                        baseVisualShapeIndex=vs,
+                        basePosition=ring_pos,
+                        physicsClientId=client,
+                    )
+                    self._glow_ids[i] = body_id
+                else:
+                    # Teleport and recolour existing ring
+                    p.resetBasePositionAndOrientation(
+                        self._glow_ids[i],
+                        ring_pos,
+                        p.getQuaternionFromEuler([0, 0, 0]),
+                        physicsClientId=client,
+                    )
+                    p.changeVisualShape(
+                        self._glow_ids[i], -1,
+                        rgbaColor=ring_col,
+                        physicsClientId=client,
+                    )
+            else:
+                # Hide glow when not engaged
+                if self._glow_ids[i] != -1:
+                    p.resetBasePositionAndOrientation(
+                        self._glow_ids[i],
+                        [0, 0, -100],
+                        p.getQuaternionFromEuler([0, 0, 0]),
+                        physicsClientId=client,
+                    )
+
+    def _update_burst(self) -> None:
+        """
+        Animate task-completion burst effects.
+        Each burst rapidly cycles through bright colours then fades out
+        over ~10 steps, giving a clear visual confirmation of task completion.
+        Called every step; harmless when burst_items is empty.
+        """
+        if not self.gui or not self._burst_items:
+            return
+        client = self._aviary.getPyBulletClient()
+        BURST_COLOURS = [
+            [1.0, 1.0, 0.0, 1.0],   # yellow flash
+            [1.0, 0.5, 0.0, 1.0],   # orange
+            [1.0, 1.0, 1.0, 0.9],   # white peak
+            [0.8, 0.8, 0.8, 0.7],   # silver
+            [0.6, 0.6, 0.6, 0.5],   # grey fade
+        ]
+        still_active = []
+        for body_id, steps_left, phase in self._burst_items:
+            total = 10
+            idx = min(phase, len(BURST_COLOURS) - 1)
+            colour = BURST_COLOURS[idx]
+            # Scale radius with phase: expand then shrink
+            r_scale = 1.0 + 0.8 * np.sin(phase / total * np.pi)
+            try:
+                p.changeVisualShape(
+                    body_id, -1,
+                    rgbaColor=colour,
+                    physicsClientId=client,
+                )
+            except Exception:
+                pass
+            if steps_left > 1:
+                still_active.append((body_id, steps_left - 1, phase + 1))
+            # When done: restore the grey "completed" colour
+            else:
+                try:
+                    p.changeVisualShape(
+                        body_id, -1,
+                        rgbaColor=[0.5, 0.5, 0.5, 0.4],
+                        physicsClientId=client,
+                    )
+                except Exception:
+                    pass
+        self._burst_items = still_active
+
     def close(self):
         if self._aviary is not None:
             self._aviary.close()
@@ -967,16 +1240,20 @@ class PybulletHomeEnv(MultiAgentEnv):
         )
 
     def _update_task_visual(self, task_idx: int, completed: bool):
-        """Turn completed task marker grey."""
+        """Flash the task marker on completion, then grey it out via _update_burst."""
         if task_idx >= len(self._task_object_ids):
             return
         body_id = self._task_object_ids[task_idx]
-        client  = self._aviary.getPyBulletClient()
-        p.changeVisualShape(
-            body_id, -1,
-            rgbaColor=[0.5, 0.5, 0.5, 0.4],
-            physicsClientId=client,
-        )
+        if completed and self.gui:
+            # Kick off a 10-step burst animation — _update_burst() drives it to grey
+            self._burst_items.append((body_id, 10, 0))
+        else:
+            client = self._aviary.getPyBulletClient()
+            p.changeVisualShape(
+                body_id, -1,
+                rgbaColor=[0.5, 0.5, 0.5, 0.4],
+                physicsClientId=client,
+            )
 
     # ------------------------------------------------------------------
     # Observation builder (matches HomeEnv's 15-dim layout exactly)

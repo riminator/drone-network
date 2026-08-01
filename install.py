@@ -123,6 +123,7 @@ def install_core(skip_torch: bool):
         "gymnasium>=0.29.0",
         "numpy>=1.24.0",
         "pyyaml>=6.0",
+        "scipy>=1.10.0",
     ]
     pip(*core)
 

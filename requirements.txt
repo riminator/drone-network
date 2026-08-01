@@ -2,6 +2,7 @@ gymnasium>=0.29.0
 numpy>=1.24.0
 torch>=2.0.0
 pyyaml>=6.0
+scipy>=1.10.0          # OracleAllocator Hungarian algorithm
 wandb>=0.15.0          # optional — set use_wandb: false in config.yaml to skip
 
 # Physics lab (deployment only — not needed for training)

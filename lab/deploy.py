@@ -128,19 +128,21 @@ def run_episode(
     agent_ids: list[str],
     time_scale: float = 1.0,
     step_hz: int = 48,
+    record_trajectory: bool = False,
 ) -> dict:
     """
     Run one episode.
 
-    time_scale=1.0 → real-time (sleep between steps to match physics Hz).
-    time_scale=0.3 → 0.3× speed (easier to watch).
-    time_scale=0.0 → as fast as possible (benchmarking).
+    time_scale=1.0 → real-time.  time_scale=0.3 → slow-mo.  0 → max speed.
+    record_trajectory=True → return full per-step trajectory in stats dict.
     """
     obs_dict, _ = env.reset()
     total_reward = 0.0
     steps = 0
     done = False
     step_dt = (1.0 / step_hz) / max(time_scale, 1e-6) if time_scale > 0 else 0.0
+
+    trajectory: list[dict] = []   # populated when record_trajectory=True
 
     while not done:
         t0 = time.perf_counter()
@@ -158,12 +160,18 @@ def run_episode(
         total_reward += sum(reward_dict.values())
         steps += 1
 
-        done = (
-            terminated.get("__all__", False)
-            or truncated.get("__all__", False)
-        )
+        if record_trajectory:
+            trajectory.append({
+                "step":        steps,
+                "positions":   env._aviary.pos.copy(),      # (n_drones, 3)
+                "actions":     action_dict,
+                "rewards":     dict(reward_dict),
+                "task_map":    dict(env._drone_task_map),
+                "tasks_done":  [t.completed for t in env._tasks],
+            })
 
-        # Pace the loop to match time_scale
+        done = terminated.get("__all__", False) or truncated.get("__all__", False)
+
         if step_dt > 0:
             elapsed = time.perf_counter() - t0
             remaining = step_dt - elapsed
@@ -172,11 +180,90 @@ def run_episode(
 
     info = next(iter(infos.values())) if infos else {}
     return {
-        "total_reward": total_reward,
-        "steps": steps,
+        "total_reward":    total_reward,
+        "steps":           steps,
         "tasks_completed": info.get("tasks_completed", 0),
-        "tasks_total": info.get("tasks_total", 0),
+        "tasks_total":     info.get("tasks_total", 0),
+        "trajectory":      trajectory,
     }
+
+
+def replay_trajectory(
+    env: PybulletHomeEnv,
+    trajectory: list[dict],
+    agent_ids: list[str],
+    time_scale: float = 0.3,
+    step_hz: int = 48,
+) -> None:
+    """
+    Play back a recorded trajectory in the PyBullet GUI at any speed.
+
+    The env is reset and each frame's drone positions are directly
+    teleported — no policy inference is needed.  This lets you:
+      • Rewind and re-watch a completed episode at slow-motion
+      • Step through frame-by-frame (time_scale → very small)
+      • Export a clean video with --record
+
+    Args:
+        trajectory: list of frame dicts from run_episode(..., record_trajectory=True)
+        time_scale: playback speed multiplier (0.3 = 30% real-time, 0 = max)
+    """
+    import pybullet as p
+
+    print(f"\n[Replay] {len(trajectory)} frames at {time_scale}× speed")
+    env.reset()
+
+    client = env._aviary.getPyBulletClient()
+    drone_ids = env._aviary.getDroneIds()
+    step_dt = (1.0 / step_hz) / max(time_scale, 1e-6) if time_scale > 0 else 0.0
+
+    for frame in trajectory:
+        t0 = time.perf_counter()
+
+        positions = frame["positions"]    # (n_drones, 3)
+        task_map  = frame["task_map"]
+        tasks_done = frame["tasks_done"]
+
+        # Teleport each drone to its recorded position
+        for i, drone_id in enumerate(drone_ids):
+            pos = positions[i].tolist()
+            # Keep orientation upright (no rotation replay needed for overhead view)
+            _, cur_quat = p.getBasePositionAndOrientation(
+                drone_id, physicsClientId=client
+            )
+            p.resetBasePositionAndOrientation(
+                drone_id, pos, cur_quat, physicsClientId=client
+            )
+
+        # Restore task assignment state for the HUD/label overlay
+        env._drone_task_map = task_map
+        for j, task in enumerate(env._tasks):
+            if tasks_done[j] and not task.completed:
+                task.completed = True
+                env._update_task_visual(j, completed=True)
+
+        # Step the aviary physics clock (zero velocity so drones stay put)
+        zero_cmds = np.zeros((env.n_drones, 4), dtype=np.float32)
+        env._aviary.step(zero_cmds)
+        env._step_count = frame["step"]
+
+        # Refresh GUI overlays
+        if env.gui:
+            env._handle_camera_keys(positions)
+            env._sync_drone_visuals(positions)
+            env._update_trails(positions, sorted(env._agent_ids))
+            env._update_glow(positions, sorted(env._agent_ids))
+            env._update_burst()
+            env._update_debug_visuals(positions, sorted(env._agent_ids))
+            env._draw_bid_lines(positions, sorted(env._agent_ids))
+
+        if step_dt > 0:
+            elapsed = time.perf_counter() - t0
+            remaining = step_dt - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+    print("[Replay] done")
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +308,7 @@ def deploy(args: argparse.Namespace):
             stats = run_episode(
                 env, actor, agent_ids,
                 time_scale=args.time_scale,
+                record_trajectory=args.replay,
             )
             results.append(stats)
             print(
@@ -229,6 +317,14 @@ def deploy(args: argparse.Namespace):
                 f"steps={stats['steps']:4d} | "
                 f"tasks={stats['tasks_completed']}/{stats['tasks_total']}"
             )
+
+            # Replay the recorded trajectory immediately after the live episode
+            if args.replay and stats["trajectory"]:
+                print(f"  Replaying episode {ep} at {args.replay_speed}× ...")
+                replay_trajectory(
+                    env, stats["trajectory"], agent_ids,
+                    time_scale=args.replay_speed,
+                )
 
     except KeyboardInterrupt:
         print("\n[STOP] Deployment interrupted.")
@@ -295,5 +391,10 @@ if __name__ == "__main__":
                         help="Run headless — faster benchmarking")
     parser.add_argument("--record",      action="store_true",
                         help="Record video via PyBullet's built-in recorder")
+    parser.add_argument("--replay",      action="store_true",
+                        help="After each live episode, replay it at --replay-speed "
+                             "(great for reviewing decisions in slow-motion)")
+    parser.add_argument("--replay-speed", type=float, default=0.15,
+                        help="Replay playback speed multiplier [default: 0.15]")
     args = parser.parse_args()
     deploy(args)

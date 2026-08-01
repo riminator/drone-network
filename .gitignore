@@ -44,3 +44,7 @@ node_modules/
 
 # Bob internal directory
 .bob/
+checkpoints_fresh/
+checkpoints_sim2real/
+checkpoints_pybullet/
+checkpoints_comm/
