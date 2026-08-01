@@ -1,9 +1,16 @@
 @echo off
 REM install.bat — Windows convenience launcher
-REM Double-click this file, or run from Command Prompt / PowerShell:
-REM   install.bat
-REM   install.bat --check
-REM   install.bat --skip-torch
+REM
+REM  HOW TO RUN
+REM  ----------
+REM  Command Prompt:  install.bat
+REM  PowerShell:      .\install.bat        <-- the .\ prefix is required in PowerShell
+REM  Double-click:    works from Explorer
+REM
+REM  Optional flags (append after the command above):
+REM    --check        verify installs only, do not install anything
+REM    --skip-torch   skip PyTorch (e.g. you have a custom CUDA build)
+REM    --skip-wandb   skip optional wandb install
 
 where python >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (

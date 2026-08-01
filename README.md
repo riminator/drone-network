@@ -531,14 +531,15 @@ Every command that uses trained weights takes two distinct flags:
 chmod +x install.sh && ./install.sh
 ```
 
-**Windows**
+**Windows** — open Command Prompt or PowerShell in the repo folder, then:
 ```bat
-install.bat
+.\install.bat
 ```
+> **PowerShell tip:** you must prefix with `.\` — typing `install.bat` alone gives *"not recognized as a cmdlet"*. Use `.\install.bat` or open a plain Command Prompt instead.
 
-**Or directly:**
+**Or directly (any platform):**
 ```bash
-python3 install.py
+python install.py
 ```
 
 > On macOS with clang 17+ / SDK 15+ (Sequoia / Tahoe) the installer patches PyBullet's source before compiling. On Windows and Linux it uses pre-built wheels.
